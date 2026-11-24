@@ -1,0 +1,104 @@
+# Bruno decision-ID lint (duplicate-prefix check)
+#
+# Fails when two decision records share a numeric `D-NNNN` prefix. A
+# decision record is exactly a file whose repo-relative path matches the
+# anchored regex `^decisions/D-[0-9]{4}-[^/]+\.md$` (#64 D9), matched
+# case-sensitively. Every other file is ignored, including
+# `decisions/_template.md`, `decisions/README.md`, `d-0007-x.md` and
+# `D-0007-x.MD`. Symlinks count as records. Any entry under `decisions/`
+# whose name contains a newline or other control character fails the lint.
+# With no `decisions/` directory the lint is a no-op and passes.
+#
+# Source: #70 (#64 item 9). Self-contained by design (#64 D7): it reads
+# no helper file from this repo, so it works when copied alone into a target
+# repo. `/bruno init` seeds it only when `decisions` is `files` or `both`
+# (#67). The same logic is embedded in the bruno skill for the local check
+# in personal/beads mode; keep the block between the BEGIN/END markers
+# byte-identical to the skill's copy.
+#
+# Why it also runs on push to the default branch: GitHub does not re-run a
+# PR's checks when its base changes. Two PRs can each pass while both add
+# the next ID; the post-merge run on the default branch catches the second
+# one. Where available, also require branches to be up to date before
+# merging, or use a merge queue (the `merge_group` trigger covers it), so
+# the duplicate is caught before merge.
+#
+# Fix for a failure: renumber the later record (see "Renumbering" in the
+# bruno skill and method/decision-records.md).
+#
+# Permissions required: `contents: read`.
+
+name: Bruno decision-ID lint
+
+on:
+  pull_request:
+  merge_group:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  duplicate-decision-ids:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Push runs only on the default branch; every PR and merge-queue run.
+    if: github.event_name != 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check for duplicate D-NNNN prefixes
+        shell: bash
+        run: |
+          # BEGIN decision-id-lint
+          set -euo pipefail
+          export LC_ALL=C
+          if [ ! -d decisions ]; then
+            echo "decision-id-lint: no decisions/ directory; nothing to check."
+            exit 0
+          fi
+          list=$(mktemp "${TMPDIR:-/tmp}/decision-id-lint.XXXXXX")
+          trap 'rm -f "$list"' EXIT
+          if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            git ls-files -z --cached --others --exclude-standard -- decisions/ > "$list"
+          else
+            find decisions -mindepth 1 \( -type f -o -type l \) -print0 > "$list"
+          fi
+          re='^decisions/D-[0-9]{4}-[^/]+\.md$'
+          records=()
+          bad=0
+          while IFS= read -r -d '' p; do
+            if [[ "$p" == *[[:cntrl:]]* ]]; then
+              printf 'BADNAME: control character in a decisions/ file name: %q\n' "$p"
+              bad=1
+              continue
+            fi
+            if [[ "$p" =~ $re ]]; then
+              records+=("$p")
+            fi
+          done < "$list"
+          if [ "$bad" -ne 0 ]; then
+            echo "Rename the file(s) above; decision file names must not contain control characters."
+            exit 1
+          fi
+          if [ "${#records[@]}" -eq 0 ]; then
+            echo "decision-id-lint: no decision records; nothing to check."
+            exit 0
+          fi
+          dups=$(printf '%s\n' "${records[@]}" \
+            | sed -E 's#^decisions/(D-[0-9]{4})-.*#\1#' | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            for id in $dups; do
+              echo "DUPLICATE: $id is used by more than one decision record:"
+              for r in "${records[@]}"; do
+                if [[ "$r" == "decisions/$id-"* ]]; then
+                  echo "  $r"
+                fi
+              done
+            done
+            echo "Renumber the later record to the next free ID (max on the default branch + 1)."
+            exit 1
+          fi
+          echo "decision-id-lint: OK, ${#records[@]} decision records, all IDs unique."
+          # END decision-id-lint

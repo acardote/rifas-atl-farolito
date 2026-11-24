@@ -1,0 +1,555 @@
+# Bruno decisions append-only lint (#71)
+#
+# Mechanically enforces the frozen-body invariant of decision records
+# (method/decision-records.md, SPEC-A2/A3) on every pull request:
+#   - only files matching ^decisions/D-[0-9]{4}-[^/]+\.md$ are checked;
+#   - the old body (from the first `## ` on) is a byte-prefix of the new body;
+#   - a header change comes with a new `## Amendment N` that quotes the old
+#     header verbatim as a `> ` blockquote (creation is exempt);
+#   - existing Linked:/Unlinked: lines are never edited, and `Unlinked: #Y`
+#     needs #Y to be currently linked;
+#   - Amendments start at 1, increase by one, and nothing but
+#     `## Amendment N` headings follows `## Amendment 1`;
+#   - header shape, and Status in proposed | accepted | rejected | superseded.
+#   - text appended to the body starts with a new `## Amendment N`, and no
+#     code fence is left open at the end of the file.
+# The unit is the PR as a whole: the merge result (HEAD of the pull_request
+# checkout) is compared with merge-base(HEAD^1, HEAD^2), so a header change
+# split over several commits is judged once.
+#
+# SELF-CONTAINED: the lint is inlined below and needs nothing from
+# bruno-method's scripts/. Its canonical source is scripts/decision_lint.py in
+# acardote/bruno-method; tests there keep this copy byte-identical.
+#
+# SCOPE: does nothing unless .bruno/config.toml on the BASE side of the merge
+# (HEAD^1) sets a top-level `decisions = "files"` or `"both"`. A missing
+# config means "issues". `/bruno init` seeds this file only under files/both.
+#
+# THREAT MODEL: honest-author defense with some hardening, not adversary-proof.
+#   - Hardened: the config is read from the base commit, so a PR cannot turn
+#     off its own lint by editing .bruno/config.toml. The base is computed
+#     from the merge commit, not taken from the event payload. The token is
+#     read-only, credentials are not persisted, checkout is pinned to a commit
+#     SHA, and there are no secrets and no third-party code. File names are
+#     escaped in workflow-command output, so a crafted name cannot forge a
+#     `::` command.
+#   - Not covered: a PR runs this workflow from its own merge commit, so it can
+#     edit or delete the workflow. Make this job a required check, and protect
+#     workflow changes with branch protection and CODEOWNERS. History rewrites
+#     (force-push to the default branch) are left to branch protection.
+
+name: Bruno decisions lint
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  append-only-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Append-only lint on decision records
+        run: |
+          set -euo pipefail
+          lint="${RUNNER_TEMP:-/tmp}/bruno_decision_lint.py"
+          cat > "$lint" <<'BRUNO_DECISION_LINT_EOF'
+          #!/usr/bin/env python3
+          # Bruno decision-record append-only lint and reference link parser (#71).
+          #
+          # Canonical source: scripts/decision_lint.py in acardote/bruno-method.
+          # Byte-identical copies are inlined in the bruno-decisions-lint workflow and
+          # in the bruno skill (skill/SKILL.md), so neither needs this repo's scripts/.
+          # Edit this file, then run `python3 scripts/sync_decision_lint.py --write`.
+          # Python 3.8+, standard library only. Format: method/decision-records.md.
+          #
+          # Usage:
+          #   decision_lint.py --base REF [--head REF | --head :worktree] [--config PATH]
+          #   decision_lint.py --path decisions/D-0001-x.md [--old FILE] [--new FILE]
+          #   decision_lint.py --parse-links FILE
+          # Exit status: 0 clean (warnings allowed), 1 lint errors, 2 usage or git error.
+          import argparse
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          # Patterns ending in a full-line match are used with fullmatch(), never with "$",
+          # which would also match before a trailing newline.
+          RECORD_PATH_RE = re.compile(r"decisions/D-[0-9]{4}-[^/]+\.md", re.S)
+          CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+          LINK_RE = re.compile(r"(Linked|Unlinked): #([0-9]+)[ \t\r]*")
+          HTML_OPEN_RE = re.compile(r" {0,3}<!--")
+          FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
+          QUOTE_RE = re.compile(r"^ {0,3}>")
+          QUOTE_STRIP_RE = re.compile(r"^ {0,3}> ?")
+          NOT_LAZY_RE = re.compile(r"^ {0,3}([#*+-]|[0-9]+[.)])")
+          H1_RE = re.compile(r"^# D-[0-9]{4}: \S")
+          KV_RE = re.compile(r"([A-Za-z][A-Za-z0-9-]*):(?: (.*))?")
+          AMEND_RE = re.compile(r"## Amendment ([0-9]+)(?:[ \t].*)?")
+          STATUSES = ("proposed", "accepted", "rejected", "superseded")
+
+
+          def classify(lines):
+              """One kind per line: "fence" (code fence), "quote" (blockquote), "html"
+              (an HTML comment block) or "text"."""
+              return scan(lines)[0]
+
+
+          def near_miss(line):
+              """True for a line that looks like a link line after optional whitespace and
+              one optional `-`/`*`. Linear time: no backtracking regex."""
+              i = 0
+              n = len(line)
+              while i < n and line[i].isspace():
+                  i += 1
+              if i < n and line[i] in "-*":
+                  i += 1
+              while i < n and line[i].isspace():
+                  i += 1
+              return line.startswith("Linked:", i) or line.startswith("Unlinked:", i)
+
+
+          def scan(lines):
+              """(kinds, open_fence_line): open_fence_line is the 1-based line of a code
+              fence still open at the end of lines, or None.
+
+              A non-blank line right after a non-empty blockquote line is a lazy
+              continuation of that blockquote, as in CommonMark, unless it opens a
+              heading, list item or fence. A line starting with `<!--` (up to three
+              spaces of indent) opens an HTML comment block that runs to the first line
+              containing `-->`, as CommonMark's HTML block type 2.
+              """
+              kinds = []
+              fence = None
+              fence_line = None
+              html = False
+              lazy = False
+              for no, line in enumerate(lines, 1):
+                  if fence is not None:
+                      kinds.append("fence")
+                      m = FENCE_RE.fullmatch(line)
+                      if (m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+                              and not m.group(2).strip()):
+                          fence = None
+                          fence_line = None
+                      continue
+                  if html:
+                      kinds.append("html")
+                      html = "-->" not in line
+                      continue
+                  if QUOTE_RE.match(line):
+                      kinds.append("quote")
+                      lazy = bool(QUOTE_STRIP_RE.sub("", line, count=1).strip())
+                      continue
+                  m = FENCE_RE.fullmatch(line)
+                  if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                      kinds.append("fence")
+                      fence = m.group(1)
+                      fence_line = no
+                      lazy = False
+                      continue
+                  m = HTML_OPEN_RE.match(line)
+                  if m:
+                      kinds.append("html")
+                      html = "-->" not in line[m.end():]
+                      lazy = False
+                      continue
+                  if lazy and line.strip() and not NOT_LAZY_RE.match(line):
+                      kinds.append("quote")
+                      continue
+                  lazy = False
+                  kinds.append("text")
+              return kinds, fence_line
+
+
+          def parse_links(text):
+              """Reference link parser. Returns (entries, warnings).
+
+              entries: [(kind, issue_number, line_no)] in document order, where kind is
+              "Linked" or "Unlinked" and issue_number is an int. warnings:
+              [(line_no, message)] for near misses that the grammar rejects.
+              """
+              lines = text.split("\n")
+              entries = []
+              warnings = []
+              for no, (line, kind) in enumerate(zip(lines, classify(lines)), 1):
+                  if kind == "text":
+                      m = LINK_RE.fullmatch(line)
+                      if m:
+                          entries.append((m.group(1), int(m.group(2)), no))
+                      elif near_miss(line):
+                          warnings.append((no, "near-miss link line is not counted: a link line is "
+                                               "a bare `Linked: #N` or `Unlinked: #N`, one per line, "
+                                               "no indent or bullet"))
+                  elif kind == "quote" and not QUOTE_RE.match(line) and LINK_RE.fullmatch(line):
+                      warnings.append((no, "link line is not counted: it continues the blockquote "
+                                           "above it; put a blank line before it"))
+              return entries, warnings
+
+
+          def linked_set(entries):
+              """Issues currently linked: the last Linked/Unlinked entry for each wins."""
+              state = {}
+              for kind, number, _ in entries:
+                  state[number] = kind == "Linked"
+              return sorted(n for n, linked in state.items() if linked)
+
+
+          def split_record(text):
+              """Return (header, body). The body starts at the first line that begins "## "."""
+              pos = 0
+              for line in text.split("\n"):
+                  if line.startswith("## "):
+                      return text[:pos], text[pos:]
+                  pos += len(line) + 1
+              return text, None
+
+
+          def parse_record(text):
+              """Parse one record. Returns a dict with header, body, keys, amendments, errors."""
+              header, body = split_record(text)
+              errors = []
+              keys = {}
+              first = True
+              for no, raw in enumerate(header.split("\n"), 1):
+                  line = raw.rstrip()
+                  if not line:
+                      continue
+                  if first and line.startswith("# "):
+                      first = False
+                      if not H1_RE.match(line):
+                          errors.append((no, "the H1 line must be `# D-NNNN: <title>`"))
+                      continue
+                  first = False
+                  m = KV_RE.fullmatch(line)
+                  if not m:
+                      errors.append((no, "header line is not `Key: value` (the header ends at the "
+                                         "first `## ` heading; `Current` is a single line)"))
+                      continue
+                  key, value = m.group(1), (m.group(2) or "").strip()
+                  if key in keys:
+                      errors.append((no, "duplicate header key `%s`" % key))
+                      continue
+                  keys[key] = (no, value)
+                  if key in ("Linked", "Unlinked"):
+                      errors.append((no, "link lines belong in the body, after the first `## ` heading"))
+              if "Status" not in keys:
+                  errors.append((1, "the header has no `Status:` line"))
+              elif keys["Status"][1] not in STATUSES:
+                  errors.append((keys["Status"][0], "`Status` must be exactly one of proposed | accepted | "
+                                                    "rejected | superseded (case-sensitive), not `%s`"
+                                                    % keys["Status"][1]))
+              if "Current" not in keys or not keys["Current"][1]:
+                  errors.append((keys.get("Current", (1,))[0], "the header needs a non-empty, single-line "
+                                                               "`Current:`"))
+              if "Superseded-by" in keys and not keys["Superseded-by"][1]:
+                  errors.append((keys["Superseded-by"][0], "omit `Superseded-by` when it is empty"))
+              amendments = []
+              if body is None:
+                  errors.append((header.count("\n") + 1, "the record has no body: the frozen body starts "
+                                                          "at the first `## ` heading"))
+                  return {"header": header, "body": None, "keys": keys, "amendments": amendments,
+                          "errors": errors, "body_line": header.count("\n")}
+              base = header.count("\n")
+              blines = body.split("\n")
+              kinds, open_fence = scan(blines)
+              if open_fence is not None:
+                  errors.append((base + open_fence, "unclosed code fence: every fence must be closed "
+                                                    "before the end of the file"))
+              expected = 1
+              offset = 0
+              for i, (raw, kind) in enumerate(zip(blines, kinds)):
+                  start = offset
+                  offset += len(raw) + 1
+                  if kind != "text" or not raw.startswith("## "):
+                      continue
+                  no = base + i + 1
+                  line = raw.rstrip()
+                  m = AMEND_RE.fullmatch(line)
+                  if m:
+                      number = int(m.group(1))
+                      if i == 0:
+                          errors.append((no, "the body must open with the original section, "
+                                             "not an Amendment"))
+                      elif number != expected:
+                          errors.append((no, "expected `## Amendment %d`, found `## Amendment %d`: "
+                                             "Amendments start at 1 and increase by one, with no gaps "
+                                             "or duplicates" % (expected, number)))
+                      expected = number + 1
+                      amendments.append((number, start, no))
+                  elif line.startswith("## Amendment"):
+                      errors.append((no, "malformed Amendment heading: use `## Amendment N`"))
+                  elif amendments:
+                      errors.append((no, "only `## Amendment N` headings may follow `## Amendment 1`"))
+              return {"header": header, "body": body, "keys": keys, "amendments": amendments,
+                      "errors": errors, "body_line": base}
+
+
+          def quote_runs(segment):
+              """Explicit `> ` blockquote runs in segment, as lists of non-blank unquoted lines."""
+              runs = []
+              current = []
+              lines = segment.split("\n")
+              for line, kind in zip(lines, classify(lines)):
+                  if kind == "quote" and QUOTE_RE.match(line):
+                      stripped = QUOTE_STRIP_RE.sub("", line, count=1).rstrip()
+                      if stripped:
+                          current.append(stripped)
+                  elif current:
+                      runs.append(current)
+                      current = []
+              if current:
+                  runs.append(current)
+              return runs
+
+
+          def quotes_header(segment, header):
+              """True when segment holds the header's non-blank lines, in order, in one blockquote."""
+              want = [line.rstrip() for line in header.split("\n") if line.strip()]
+              if not want:
+                  return True
+              for run in quote_runs(segment):
+                  for k in range(len(run) - len(want) + 1):
+                      if run[k:k + len(want)] == want:
+                          return True
+              return False
+
+
+          def lint_change(path, old, new):
+              """Lint one file change. old/new are str or None. Returns (errors, warnings)."""
+              if not RECORD_PATH_RE.fullmatch(path):
+                  return [], []
+              if CONTROL_RE.search(path):
+                  return [(1, "decision record file names must not contain control characters")], []
+              if new is None:
+                  return [(1, "decision records are append-only: never delete or rename one")], []
+              rec = parse_record(new)
+              errors = list(rec["errors"])
+              entries, warnings = parse_links(new)
+              old_entries = []
+              if old is not None:
+                  orec = parse_record(old)
+                  old_entries, _ = parse_links(old)
+                  obody = orec["body"] or ""
+                  nbody = rec["body"] or ""
+                  prefix_ok = nbody.startswith(obody)
+                  if orec["body"] is not None and scan(obody.split("\n"))[1] is not None:
+                      errors.append((1, "the base version ends inside an unclosed code fence, so appended "
+                                        "text cannot be checked; close the fence in the base first"))
+                  if prefix_ok and orec["body"] is not None and len(nbody) > len(obody):
+                      first = [a for a in rec["amendments"] if a[1] >= len(obody)]
+                      gap = nbody[len(obody):first[0][1]] if first else nbody[len(obody):]
+                      if not first or gap.strip(" \t\r\n"):
+                          errors.append((rec["body_line"] + obody.count("\n") + 1,
+                                         "text appended after the frozen body must start with a new "
+                                         "`## Amendment N` heading; the original section and earlier "
+                                         "Amendments are frozen"))
+                  if not prefix_ok:
+                      k = 0
+                      while k < len(obody) and k < len(nbody) and obody[k] == nbody[k]:
+                          k += 1
+                      errors.append((rec["body_line"] + nbody[:k].count("\n") + 1,
+                                     "frozen body changed: the old body (from the first `## ` heading on) "
+                                     "must be a byte-prefix of the new body; append a new "
+                                     "`## Amendment N` instead"))
+                  if [e[:2] for e in entries[:len(old_entries)]] != [e[:2] for e in old_entries]:
+                      errors.append((1, "an existing `Linked:`/`Unlinked:` line was edited, moved or "
+                                        "removed; links change only by appending lines"))
+                  if orec["header"] != rec["header"]:
+                      if prefix_ok:
+                          added = [a for a in rec["amendments"] if a[1] >= len(obody)]
+                      else:
+                          top = max([a[0] for a in orec["amendments"]] or [0])
+                          added = [a for a in rec["amendments"] if a[0] > top]
+                      if not added:
+                          errors.append((1, "header changed without a new `## Amendment N` in this change"))
+                      elif not quotes_header(nbody[added[0][1]:], orec["header"]):
+                          errors.append((added[0][2], "header changed, but no new Amendment quotes the old "
+                                                      "header verbatim as a `> ` blockquote"))
+              state = {}
+              for index, (kind, number, no) in enumerate(entries):
+                  if index >= len(old_entries) and kind == "Unlinked" and not state.get(number):
+                      errors.append((no, "`Unlinked: #%d`, but #%d is not currently linked" % (number, number)))
+                  state[number] = kind == "Linked"
+              return errors, warnings
+
+
+          def decisions_mode(path):
+              """Top-level `decisions` key of a .bruno/config.toml: ("issues"|"files", error)."""
+              if not os.path.isfile(path):
+                  return "issues", None
+              with open(path, encoding="utf-8") as handle:
+                  lines = handle.read().split("\n")
+              found = []
+              for no, line in enumerate(lines, 1):
+                  s = line.strip()
+                  if s.startswith("["):
+                      break
+                  if s.startswith("#"):
+                      continue
+                  # Quoted ("decisions" =) and dotted (decisions.x =) keys are valid TOML
+                  # for the same key; they are found here and refused below (#69).
+                  if re.match(r"""(decisions|"decisions"|'decisions')\s*[=.]""", s):
+                      found.append((no, s))
+              if not found:
+                  return "issues", None
+              if len(found) == 1:
+                  m = re.fullmatch(r'decisions\s*=\s*"(issues|files|both)"\s*(#.*)?', found[0][1])
+                  if m:
+                      return ("issues" if m.group(1) == "issues" else "files"), None
+              return None, ("Config at %s line %d has an invalid `decisions` setting: `%s`. Allowed: one "
+                            "top-level `decisions = \"issues\" | \"files\" | \"both\"` before the first "
+                            "`[table]` header (absent means \"issues\")." % (path, found[0][0], found[0][1]))
+
+
+          def git(args, cwd=None):
+              return subprocess.run(["git"] + args, cwd=cwd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=True).stdout
+
+
+          def blob(rev, path, cwd):
+              try:
+                  return git(["cat-file", "blob", "%s:%s" % (rev, path)], cwd)
+              except subprocess.CalledProcessError:
+                  return None
+
+
+          def git_changes(base, head):
+              """[(path, old_bytes, new_bytes)] for records changed between merge-base and head."""
+              top = git(["rev-parse", "--show-toplevel"]).decode().strip()
+              worktree = head == ":worktree"
+              mb = git(["merge-base", base, "HEAD" if worktree else head], top).decode().strip()
+              if worktree:
+                  names = git(["diff", "--name-only", "--no-renames", "-z", mb, "--"], top).split(b"\0")
+                  names += git(["ls-files", "--others", "--exclude-standard", "-z"], top).split(b"\0")
+              else:
+                  names = git(["diff", "--name-only", "--no-renames", "-z", mb, head, "--"],
+                              top).split(b"\0")
+              changes = []
+              for raw in sorted(set(n for n in names if n)):
+                  path = raw.decode("utf-8", "surrogateescape")
+                  if not RECORD_PATH_RE.fullmatch(path):
+                      continue
+                  if worktree:
+                      full = os.path.join(top, path)
+                      new = None
+                      if os.path.isfile(full):
+                          with open(full, "rb") as handle:
+                              new = handle.read()
+                  else:
+                      new = blob(head, path, top)
+                  changes.append((path, blob(mb, path, top), new))
+              return changes
+
+
+          def read_file(path):
+              with open(path, "rb") as handle:
+                  return handle.read()
+
+
+          def decode(data):
+              if data is None:
+                  return None, None
+              try:
+                  return data.decode("utf-8"), None
+              except UnicodeDecodeError:
+                  return None, "the file is not valid UTF-8"
+
+
+          def escape_data(text):
+              return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def escape_property(text):
+              return escape_data(text).replace(":", "%3A").replace(",", "%2C")
+
+
+          def emit(level, path, no, message):
+              """Print one finding. Escaping follows the workflow-command rules, so no file
+              name or message can start or forge a `::` command."""
+              if os.environ.get("GITHUB_ACTIONS") == "true":
+                  print("::%s file=%s,line=%d::%s" % (level, escape_property(path), no, escape_data(message)))
+              else:
+                  shown = ascii(path) if CONTROL_RE.search(path) else path
+                  print("%s:%d: %s: %s" % (shown, no, level, message))
+
+
+          def main(argv=None):
+              ap = argparse.ArgumentParser(description="Bruno decision-record append-only lint (#71).")
+              ap.add_argument("--base", help="base ref; the change is linted against merge-base(base, head)")
+              ap.add_argument("--head", default="HEAD", help="head ref, or :worktree for the working tree")
+              ap.add_argument("--config", help="skip unless this config sets decisions to files or both")
+              ap.add_argument("--path", help="repo-relative path, for linting an --old/--new file pair")
+              ap.add_argument("--old", help="old version of --path (omit for a new record)")
+              ap.add_argument("--new", help="new version of --path (omit for a deleted record)")
+              ap.add_argument("--parse-links", metavar="FILE", help="print the parsed links as JSON")
+              args = ap.parse_args(argv)
+              if args.parse_links:
+                  entries, warnings = parse_links(read_file(args.parse_links).decode("utf-8"))
+                  print(json.dumps({"entries": [[k, n] for k, n, _ in entries],
+                                    "linked": linked_set(entries),
+                                    "warning_lines": [no for no, _ in warnings]}))
+                  return 0
+              if args.config is not None:
+                  mode, error = decisions_mode(args.config)
+                  if error:
+                      print("ERROR: " + error)
+                      return 1
+                  if mode == "issues":
+                      print("decisions is absent or \"issues\" in %s: nothing to lint." % args.config)
+                      return 0
+              try:
+                  if args.path:
+                      if args.old is None and args.new is None:
+                          ap.error("--path needs --old, --new or both")
+                      changes = [(args.path, read_file(args.old) if args.old else None,
+                                  read_file(args.new) if args.new else None)]
+                  elif args.base:
+                      changes = git_changes(args.base, args.head)
+                  else:
+                      ap.error("give --base (git mode), --path (file mode) or --parse-links")
+              except subprocess.CalledProcessError as exc:
+                  print("ERROR: git %s failed: %s" % (" ".join(exc.cmd[1:]),
+                                                       exc.stderr.decode(errors="replace").strip()))
+                  return 2
+              except OSError as exc:
+                  print("ERROR: %s" % exc)
+                  return 2
+              failures = 0
+              for path, old_bytes, new_bytes in changes:
+                  old, old_error = decode(old_bytes)
+                  new, new_error = decode(new_bytes)
+                  if old_error or new_error:
+                      errors, warnings = [(1, old_error or new_error)], []
+                  else:
+                      errors, warnings = lint_change(path, old, new)
+                  for no, message in warnings:
+                      emit("warning", path, no, message)
+                  for no, message in errors:
+                      emit("error", path, no, message)
+                  failures += len(errors)
+              if failures:
+                  print("FAIL: %d append-only lint error(s) in decision records." % failures)
+                  return 1
+              print("OK: %d decision record change(s) checked." % len(changes))
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          BRUNO_DECISION_LINT_EOF
+          cfg="${RUNNER_TEMP:-/tmp}/bruno_base_config.toml"
+          rm -f "$cfg"
+          if git cat-file -e 'HEAD^1:.bruno/config.toml' 2>/dev/null; then
+            git show 'HEAD^1:.bruno/config.toml' > "$cfg"
+          fi
+          base="$(git merge-base HEAD^1 HEAD^2)"
+          python3 "$lint" --config "$cfg" --base "$base" --head HEAD

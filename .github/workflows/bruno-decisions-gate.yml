@@ -1,0 +1,612 @@
+# Bruno decisions-gate
+#
+# Enforces the decision-record close check (method/decision-records.md,
+# "Close-gate check") for projects that opt in with a top-level
+# `decisions = "files"` or `decisions = "both"` in `.bruno/config.toml`.
+# It is a SEPARATE workflow from `bruno-close-gate.yml`, which stays
+# byte-identical (#64 owner decision D1), so projects without the key keep
+# exactly the old enforcement.
+#
+# SCOPE: fires only for issues labeled `parent` or `child`, the same filter
+# as `bruno-close-gate.yml`. Plain issues bypass.
+#
+# CONFIG READ (#64 D3): `.bruno/config.toml` is read through the contents
+# API at the default branch, never through a checkout. Before it is read,
+# the `.bruno` tree entry must be a directory and the config a regular file
+# (a symlinked config refuses), in every mode. Only the top-level
+# `decisions` key counts (a `decisions =` line before the first `[table]`
+# header). This matches the skill's validator (skill/SKILL.md, "`decisions`
+# key"):
+#   - no config, or no top-level key           -> `issues` -> no-op, close stands
+#   - `"issues"`                               -> no-op, close stands
+#   - `"files"` / `"both"`                     -> run the decision check
+#   - any other value, a duplicate top-level key, a table-nested
+#     `"files"`/`"both"`, or an unsupported key form (quoted
+#     `"decisions" =`, dotted `decisions.x =`) -> refuse and reopen
+#   - any other read error (403, 5xx, rate limit, unexpected payload)
+#                                              -> refuse and reopen (fail closed)
+# Limitation: the reader is line-based, not a TOML parser. A `decisions =`
+# line inside a multi-line string, or a line starting with `[` inside a
+# multi-line array, is misread. Init writes the key right after `mode =`,
+# before any such construct.
+#
+# DEFAULT-BRANCH READS (#64 A4): each run resolves the default branch to one
+# commit SHA at run time (not at event time), then reads every file at that
+# SHA. Trees are read by path (`.bruno`, `decisions`), never recursively. A
+# decision file that exists only on a feature branch or PR head is invisible
+# to this gate.
+#
+# CHECK LOGIC (#69, #64 item 5): in `files`/`both` mode, every bare
+# `Decided-by: D-NNNN` line in the issue body (read live) or in a comment by
+# an OWNER, MEMBER or COLLABORATOR, outside code fences, blockquotes and
+# HTML comments, must resolve to exactly one decision record
+# (`^decisions/D-[0-9]{4}-[^/]+\.md$`, D9) on the default branch whose
+# header has exactly one `Status:` line, `Status: accepted` (D8), and whose
+# links currently include the issue: for each #Y the last `Linked:` /
+# `Unlinked:` entry in document order decides, numbers compared as integers
+# (D13). These refuse: zero records, two records for one ID (provisional,
+# pending the owner's D13 call), any other line that looks like a citation
+# (any case, anywhere in the line, or inside a fence left open at the end),
+# `decisions` that is not a directory, and an issue with more than 2000
+# comments or 2 MB of text. The link parser below is a JS port of the
+# bruno-method reference lint (#71, D5); bruno-method's harness runs it
+# against the shared fixtures. The skill's local gate applies the same rules,
+# and the harness compares their verdicts.
+#
+# FAIL CLOSED ON TIMEOUT: the check step has an 8-minute limit inside a
+# 10-minute job. If it fails, times out or is cancelled before it has
+# reopened the issue, the last step reopens it with a fixed reason.
+#
+# ISSUE COMMENTS carry fixed reason categories only (the cited D-NNNN and
+# issue number are the only variable parts). Record paths and raw API error
+# text go to the run log (`core.warning`), never into the issue.
+#
+# Permissions required: `contents: read` (to read files at the default
+# branch) and `issues: write` (to reopen + comment + label). Nothing else,
+# and no repository checkout step. Insufficient permissions fail loudly.
+
+name: Bruno decisions-gate
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: decisions-gate-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  enforce-decisions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      contains(github.event.issue.labels.*.name, 'parent') ||
+      contains(github.event.issue.labels.*.name, 'child')
+    steps:
+      - name: Enforce decision-record gate
+        id: gate
+        timeout-minutes: 8
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+            const labels = (context.payload.issue.labels || []).map(l => l.name);
+
+            // A condition that must refuse the close. `category` is a fixed
+            // string and is the only text posted to the issue; `detail` goes
+            // to the run log only.
+            class Refusal extends Error {
+              constructor(category, detail) {
+                super(category);
+                this.category = category;
+                this.detail = detail || '';
+              }
+            }
+
+            const describe = (e) =>
+              `${e && e.status ? `HTTP ${e.status}: ` : ''}${(e && e.message) || String(e)}`;
+
+            // ---- Read helpers (default branch only, no checkout) ----------
+
+            // Resolve the default branch to one commit SHA so every read in
+            // this run sees the same tree, and a same-named tag cannot shadow it.
+            const defaultBranch =
+              (context.payload.repository && context.payload.repository.default_branch) || '';
+            let defaultSha;
+            const resolveDefaultSha = async () => {
+              if (defaultSha) return defaultSha;
+              if (!defaultBranch) {
+                throw new Refusal('could not resolve the default branch', 'event payload has no repository.default_branch');
+              }
+              try {
+                const { data } = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${defaultBranch}`,
+                });
+                defaultSha = data.object.sha;
+              } catch (e) {
+                throw new Refusal('could not resolve the default branch', `heads/${defaultBranch}: ${describe(e)}`);
+              }
+              return defaultSha;
+            };
+
+            // Returns the file text, or null on 404. Any other error refuses.
+            const readAtDefault = async (path) => {
+              const ref = await resolveDefaultSha();
+              let res;
+              try {
+                res = await github.rest.repos.getContent({
+                  owner, repo, path, ref, mediaType: { format: 'raw' },
+                });
+              } catch (e) {
+                if (e && e.status === 404) return null;
+                throw new Refusal(`could not read \`${path}\` on the default branch`, describe(e));
+              }
+              if (typeof res.data !== 'string') {
+                throw new Refusal(`\`${path}\` on the default branch is not a regular file`,
+                  `payload type ${res.data && res.data.type}`);
+              }
+              return res.data;
+            };
+
+            // One tree, not recursive. A truncated or malformed listing refuses.
+            const SHA_RE = /^[0-9a-f]{40}$/;
+            const readTree = async (tree_sha, what) => {
+              let res;
+              try {
+                res = await github.rest.git.getTree({ owner, repo, tree_sha });
+              } catch (e) {
+                throw new Refusal(what, describe(e));
+              }
+              const ok = res.data && Array.isArray(res.data.tree) && res.data.truncated === false
+                && res.data.tree.every(e => e && typeof e.path === 'string' && typeof e.type === 'string'
+                  && typeof e.mode === 'string' && typeof e.sha === 'string' && SHA_RE.test(e.sha));
+              if (!ok) {
+                throw new Refusal(what, res.data && res.data.truncated ? 'tree listing truncated' : 'unexpected tree payload');
+              }
+              return res.data.tree;
+            };
+            let rootTree;
+            const rootEntry = async (name) => {
+              if (!rootTree) rootTree = await readTree(await resolveDefaultSha(), 'could not list the default branch');
+              return rootTree.find(e => e.path === name) || null;
+            };
+            const isRegular = (e) => e.type === 'blob' && (e.mode === '100644' || e.mode === '100755');
+
+            // False when the default branch has no `.bruno/config.toml`.
+            // Refuses when `.bruno` is not a directory or the config is not a
+            // regular file (for example a symlink).
+            const configPresent = async () => {
+              const dot = await rootEntry('.bruno');
+              if (!dot) return false;
+              if (dot.type !== 'tree') {
+                throw new Refusal('`.bruno` on the default branch is not a directory', `type ${dot.type}, mode ${dot.mode}`);
+              }
+              const cfg = (await readTree(dot.sha, 'could not list `.bruno/` on the default branch'))
+                .find(e => e.path === 'config.toml');
+              if (!cfg) return false;
+              if (!isRegular(cfg)) {
+                throw new Refusal('`.bruno/config.toml` on the default branch is not a regular file', `type ${cfg.type}, mode ${cfg.mode}`);
+              }
+              return true;
+            };
+
+            // Decision-record paths on the default branch (#64 D9): files
+            // directly under `decisions/` named `D-NNNN-<slug>.md`. Refuses
+            // when `decisions` is not a directory or a record is not a
+            // regular file (symlink, submodule, directory).
+            const recordNameRe = /^D-[0-9]{4}-[^/]+\.md$/;
+            const listDecisionRecords = async () => {
+              const dir = await rootEntry('decisions');
+              if (!dir) return [];
+              if (dir.type !== 'tree') {
+                throw new Refusal('`decisions` on the default branch is not a directory', `type ${dir.type}, mode ${dir.mode}`);
+              }
+              const out = [];
+              for (const e of await readTree(dir.sha, 'could not list `decisions/` on the default branch')) {
+                if (!recordNameRe.test(e.path)) continue;
+                if (!isRegular(e)) {
+                  throw new Refusal('a decision record path on the default branch is not a regular file',
+                    `decisions/${e.path}: type ${e.type}, mode ${e.mode}`);
+                }
+                out.push(`decisions/${e.path}`);
+              }
+              return out.sort();
+            };
+
+            // A decision record's text. The category is fixed; the path goes
+            // to the run log only.
+            const readRecord = async (path) => {
+              let text;
+              try {
+                text = await readAtDefault(path);
+              } catch (e) {
+                throw new Refusal('could not read a decision record on the default branch',
+                  `${path}: ${e instanceof Refusal ? e.detail : describe(e)}`);
+              }
+              if (text === null) {
+                throw new Refusal('could not read a decision record on the default branch', `${path}: 404`);
+              }
+              return text;
+            };
+
+            // The live issue body, then every comment by an OWNER, MEMBER or
+            // COLLABORATOR, in order. Large issues refuse up front.
+            const MAX_COMMENTS = 2000;
+            const MAX_TEXT = 2 * 1024 * 1024;
+            const TOO_BIG = 'the issue has more than 2000 comments or 2 MB of text, too much for the decisions gate to check';
+            const TRUSTED = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            const textLimits = (texts, count) => {
+              if (count > MAX_COMMENTS) throw new Refusal(TOO_BIG, `${count} comments`);
+              const size = texts.reduce((n, t) => n + Buffer.byteLength(t, 'utf8'), 0);
+              if (size > MAX_TEXT) throw new Refusal(TOO_BIG, `${size} bytes`);
+            };
+            const readIssueTexts = async () => {
+              let issue;
+              try {
+                issue = (await github.rest.issues.get({ owner, repo, issue_number })).data;
+              } catch (e) {
+                throw new Refusal('could not read the issue', describe(e));
+              }
+              if (!issue || typeof issue.comments !== 'number') {
+                throw new Refusal('could not read the issue', 'unexpected issue payload');
+              }
+              textLimits([], issue.comments);
+              let comments;
+              try {
+                comments = await github.paginate(github.rest.issues.listComments,
+                  { owner, repo, issue_number, per_page: 100 });
+              } catch (e) {
+                throw new Refusal('could not read the issue comments', describe(e));
+              }
+              if (!Array.isArray(comments)) {
+                throw new Refusal('could not read the issue comments', 'unexpected comments payload');
+              }
+              const texts = [issue.body || ''];
+              for (const c of comments) {
+                if (c && TRUSTED.includes(c.author_association)) texts.push(c.body || '');
+              }
+              textLimits(texts, comments.length);
+              return texts;
+            };
+
+            // ---- `decisions` key (#64 D3) ---------------------------------
+
+            // A line whose key is `decisions`, bare or quoted, followed by
+            // `=` or a dotted continuation. The value is the rest of the
+            // line with spaces and tabs trimmed (linear, no backtracking).
+            const keyRe = /^[ \t]*(decisions|"decisions"|'decisions')[ \t]*(=|\.)/;
+            const trimSpTab = (s) => {
+              let a = 0;
+              let b = s.length;
+              while (a < b && (s[a] === ' ' || s[a] === '\t')) a++;
+              while (b > a && (s[b - 1] === ' ' || s[b - 1] === '\t')) b--;
+              return s.slice(a, b);
+            };
+            // A plain quoted string plus an optional trailing comment.
+            const valueRe = /^(?:"([^"\\]*)"|'([^']*)')[ \t]*(?:#[^\n]*)?$/;
+            const parseValue = (raw) => {
+              const m = valueRe.exec(raw);
+              if (!m) return undefined;
+              return m[1] !== undefined ? m[1] : m[2];
+            };
+
+            const readDecisionsMode = async () => {
+              if (!(await configPresent())) return 'issues';
+              let text = await readAtDefault('.bruno/config.toml');
+              if (text === null) return 'issues';
+              if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+              const top = [];
+              const nested = [];
+              let inTable = false;
+              for (const line of text.split(/\r?\n/)) {
+                if (/^[ \t]*\[/.test(line)) { inTable = true; continue; }
+                const m = keyRe.exec(line);
+                if (!m) continue;
+                const entry = { supported: m[1] === 'decisions' && m[2] === '=', raw: trimSpTab(line.slice(m[0].length)) };
+                (inTable ? nested : top).push(entry);
+              }
+              if (top.some(e => !e.supported)) {
+                throw new Refusal('`.bruno/config.toml` uses an unsupported decisions key form; write `decisions = "<value>"`');
+              }
+              if (top.length > 1) {
+                throw new Refusal('`.bruno/config.toml` has more than one top-level `decisions` key');
+              }
+              if (top.length === 0) {
+                // A table-nested files/both means the user meant the
+                // top-level key: refuse, as the skill's validator does.
+                const meant = nested.map(e => parseValue(e.raw)).find(v => v === 'files' || v === 'both');
+                if (meant) {
+                  throw new Refusal(`\`.bruno/config.toml\` sets \`decisions = "${meant}"\` inside a table; move it to the top level, right after \`mode =\``);
+                }
+                return 'issues';
+              }
+              const value = parseValue(top[0].raw);
+              if (value === 'issues' || value === 'files' || value === 'both') return value;
+              throw new Refusal('`.bruno/config.toml` has an invalid top-level `decisions` value; expected "issues", "files" or "both"');
+            };
+
+            // ---- Link parser: JS port of the reference decision_lint.py (#71, D5)
+            // scan/parse_links/linked_set/split_record, line for line. WS is
+            // Python's str whitespace set, so strip() matches the reference
+            // exactly. All string scanning is linear: no regex here can
+            // backtrack over a run of whitespace. Issue numbers are kept as
+            // decimal strings without leading zeros, so they compare as
+            // integers (D13).
+            const WS = new Set('\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000');
+            const WSCLASS = [...WS].map(c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')).join('');
+            const pyStrip = (s) => {
+              let a = 0;
+              let b = s.length;
+              while (a < b && WS.has(s[a])) a++;
+              while (b > a && WS.has(s[b - 1])) b--;
+              return s.slice(a, b);
+            };
+            const pyRstrip = (s) => {
+              let b = s.length;
+              while (b > 0 && WS.has(s[b - 1])) b--;
+              return s.slice(0, b);
+            };
+            const FENCE_RE = /^ {0,3}(`{3,}|~{3,})([^\n]*)$/;
+            const QUOTE_RE = /^ {0,3}>/;
+            const QUOTE_STRIP_RE = /^ {0,3}> ?/;
+            const HTML_OPEN_RE = /^ {0,3}<!--/;
+            const NOT_LAZY_RE = /^ {0,3}([#*+-]|[0-9]+[.)])/;
+            const LINK_RE = /^(Linked|Unlinked): #([0-9]+)[ \t\r]*$/;
+            const nearMiss = (line) => {
+              let i = 0;
+              while (i < line.length && WS.has(line[i])) i++;
+              if (line[i] === '-' || line[i] === '*') i++;
+              while (i < line.length && WS.has(line[i])) i++;
+              return line.startsWith('Linked:', i) || line.startsWith('Unlinked:', i);
+            };
+            // { kinds, openFence }: openFence is the index of a code fence
+            // still open at the end, or -1.
+            const scan = (lines) => {
+              const kinds = [];
+              let fence = null;
+              let fenceAt = -1;
+              let html = false;
+              let lazy = false;
+              lines.forEach((line, i) => {
+                if (fence !== null) {
+                  kinds.push('fence');
+                  const m = FENCE_RE.exec(line);
+                  if (m && m[1][0] === fence[0] && m[1].length >= fence.length && !pyStrip(m[2])) {
+                    fence = null;
+                    fenceAt = -1;
+                  }
+                  return;
+                }
+                if (html) {
+                  kinds.push('html');
+                  html = !line.includes('-->');
+                  return;
+                }
+                if (QUOTE_RE.test(line)) {
+                  kinds.push('quote');
+                  lazy = pyStrip(line.replace(QUOTE_STRIP_RE, '')) !== '';
+                  return;
+                }
+                const m = FENCE_RE.exec(line);
+                if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+                  kinds.push('fence');
+                  fence = m[1];
+                  fenceAt = i;
+                  lazy = false;
+                  return;
+                }
+                const h = HTML_OPEN_RE.exec(line);
+                if (h) {
+                  kinds.push('html');
+                  html = !line.slice(h[0].length).includes('-->');
+                  lazy = false;
+                  return;
+                }
+                if (lazy && pyStrip(line) && !NOT_LAZY_RE.test(line)) {
+                  kinds.push('quote');
+                  return;
+                }
+                lazy = false;
+                kinds.push('text');
+              });
+              return { kinds, openFence: fenceAt };
+            };
+            const normNumber = (digits) => digits.replace(/^0+(?=[0-9])/, '');
+            const parseLinks = (text) => {
+              const lines = text.split('\n');
+              const { kinds } = scan(lines);
+              const entries = [];
+              const warnings = [];
+              lines.forEach((line, i) => {
+                if (kinds[i] === 'text') {
+                  const m = LINK_RE.exec(line);
+                  if (m) entries.push([m[1], normNumber(m[2]), i + 1]);
+                  else if (nearMiss(line)) warnings.push(i + 1);
+                } else if (kinds[i] === 'quote' && !QUOTE_RE.test(line) && LINK_RE.test(line)) {
+                  warnings.push(i + 1);
+                }
+              });
+              return { entries, warnings };
+            };
+            const byNumber = (a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+            const linkedSet = (entries) => {
+              const state = new Map();
+              for (const [kind, n] of entries) state.set(n, kind === 'Linked');
+              return [...state].filter(([, on]) => on).map(([n]) => n).sort(byNumber);
+            };
+            const recordHeader = (text) => {
+              let pos = 0;
+              for (const line of text.split('\n')) {
+                if (line.startsWith('## ')) return text.slice(0, pos);
+                pos += line.length + 1;
+              }
+              return text;
+            };
+
+            // ---- Decision check (#69) -------------------------------------
+            // The skill's local gate (decision_gate.py) applies the same rules.
+            const CITE_RE = /^Decided-by: (D-[0-9]{4})[ \t\r]*$/;
+            // Anything that looks like a citation, anywhere in a line, any case (ASCII).
+            const CITE_NEAR_RE = new RegExp(`[Dd][Ee][Cc][Ii][Dd][Ee][Dd][-\\u2011${WSCLASS}]*[Bb][Yy][${WSCLASS}]*:`);
+            const STATUS_RE = /^Status:(?: ([^\n]*))?$/;
+            const STATUSES = ['proposed', 'accepted', 'rejected', 'superseded'];
+            const MALFORMED = 'a `Decided-by:` line is malformed — write one bare `Decided-by: D-NNNN` per line, with no indent, bullet or second ID';
+            const citations = (texts) => {
+              const ids = [];
+              let malformed = false;
+              for (const text of texts) {
+                const lines = text.split('\n');
+                const { kinds, openFence } = scan(lines);
+                lines.forEach((line, i) => {
+                  if (kinds[i] !== 'text') return;
+                  const m = CITE_RE.exec(line);
+                  if (m) { if (!ids.includes(m[1])) ids.push(m[1]); }
+                  else if (CITE_NEAR_RE.test(line)) malformed = true;
+                });
+                if (openFence >= 0 && lines.slice(openFence).some(l => CITE_NEAR_RE.test(l))) malformed = true;
+              }
+              return { ids, malformed };
+            };
+            // The Status value, or null unless the header has exactly one Status line.
+            const recordStatus = (text) => {
+              const values = [];
+              for (const raw of recordHeader(text).split('\n')) {
+                const m = STATUS_RE.exec(pyRstrip(raw));
+                if (m) values.push(pyStrip(m[1] || ''));
+              }
+              return values.length === 1 ? values[0] : null;
+            };
+            // Reasons to refuse; [] passes.
+            const decisionCheck = async () => {
+              const { ids, malformed } = citations(await readIssueTexts());
+              const x = String(issue_number);
+              const reasons = malformed ? [MALFORMED] : [];
+              const records = ids.length ? await listDecisionRecords() : [];
+              for (const id of ids) {
+                const matches = records.filter(p => p.startsWith(`decisions/${id}-`));
+                if (matches.length === 0) {
+                  reasons.push(`Decided-by ${id} has no decision record on the default branch — merge its record to the default branch, or update the citation to the intended decision`);
+                  continue;
+                }
+                if (matches.length > 1) {
+                  core.warning(`decisions-gate detail: ${id} resolves to ${matches.join(', ')}`);
+                  reasons.push(`Decided-by ${id} resolves to more than one decision record on the default branch — renumber the record that merged later (see "Decision IDs" in the bruno skill), or update the citation to the intended decision`);
+                  continue;
+                }
+                const text = await readRecord(matches[0]);
+                const status = recordStatus(text);
+                if (status !== 'accepted') {
+                  const shown = STATUSES.includes(status) ? `Status: ${status}` : 'no valid Status line';
+                  reasons.push(`Decided-by ${id} is not accepted (${shown}) — accept it with an Amendment that sets \`Status: accepted\`, or update the citation to the intended decision`);
+                  continue;
+                }
+                if (!linkedSet(parseLinks(text).entries).includes(x)) {
+                  reasons.push(`Decided-by ${id} does not link back to #${x} — update the citation to the intended decision, or link it with \`/bruno decision link ${id} #${x}\``);
+                }
+              }
+              return { ids, reasons };
+            };
+
+            // ---- Refusal: reopen, then best-effort comment and relabel ----
+
+            const refuse = async (category, detail) => {
+              if (detail) core.warning(`decisions-gate detail: ${detail}`);
+              let reopened = true;
+              try {
+                await github.rest.issues.update({ owner, repo, issue_number, state: 'open' });
+              } catch (e) {
+                reopened = false;
+                core.warning(`Could not reopen issue: ${describe(e)}`);
+              }
+              // Tells the fallback step that this refusal already reopened the issue.
+              if (reopened) core.setOutput('handled', 'true');
+              const body = [
+                `⚠️ **Bruno decisions-gate fired** — ${category}.`,
+                '',
+                'This gate enforces decision records (`decisions = "files"` or `"both"` in `.bruno/config.toml`); see `method/decision-records.md` in [acardote/bruno-method](https://github.com/acardote/bruno-method/blob/main/method/decision-records.md). It fails closed: a config or file it cannot read refuses the close. Details are in the workflow run log.',
+                '',
+                'To proceed: fix the cause above on the default branch, then close again.',
+                '',
+                `_The gate fired at ${new Date().toISOString()}._`,
+              ].join('\n');
+              try {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              } catch (e) {
+                core.warning(`Could not comment: ${describe(e)}`);
+              }
+              // Keep `state:*` labels mutually exclusive, as the close gate does.
+              for (const ln of labels) {
+                if (ln.startsWith('state:') && ln !== 'state:reviewing') {
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number, name: ln });
+                  } catch (e) {
+                    core.warning(`Could not remove ${ln}: ${describe(e)}`);
+                  }
+                }
+              }
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['state:reviewing'] });
+              } catch (e) {
+                core.warning(`Could not add state:reviewing: ${describe(e)}`);
+              }
+              core.setFailed(`${reopened ? 'Issue reopened' : 'Issue could NOT be reopened'}: ${category}.`);
+            };
+
+            // ---- Main -----------------------------------------------------
+
+            try {
+              const mode = await readDecisionsMode();
+              if (mode === 'issues') {
+                core.info('Bruno decisions-gate — `decisions` is absent or "issues"; nothing to check, close stands.');
+                return;
+              }
+              // BEGIN decision check
+              const { ids, reasons } = await decisionCheck();
+              if (reasons.length) throw new Refusal(reasons.join('; '), `decisions = "${mode}"`);
+              core.info(`Bruno decisions-gate — ${ids.length} Decided-by citation(s) resolve, accepted and linked; close stands.`);
+            } catch (e) {
+              if (e instanceof Refusal) {
+                await refuse(e.category, e.detail);
+              } else {
+                await refuse('internal gate error', describe(e));
+              }
+            }
+
+      - name: Reopen if the gate did not finish
+        if: (failure() || cancelled()) && steps.gate.outputs.handled != 'true'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+            const status = (e) => (e && e.status ? `HTTP ${e.status}` : 'error');
+            let reopened = true;
+            try {
+              await github.rest.issues.update({ owner, repo, issue_number, state: 'open' });
+            } catch (e) {
+              reopened = false;
+              core.warning(`Could not reopen issue: ${status(e)}`);
+            }
+            const body = [
+              '⚠️ **Bruno decisions-gate fired** — the gate did not finish (error, timeout or cancellation).',
+              '',
+              'The decision check could not run to the end, so the close is refused (fail closed). Details are in the workflow run log.',
+              '',
+              'To proceed: close the issue again.',
+            ].join('\n');
+            try {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            } catch (e) {
+              core.warning(`Could not comment: ${status(e)}`);
+            }
+            try {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['state:reviewing'] });
+            } catch (e) {
+              core.warning(`Could not add state:reviewing: ${status(e)}`);
+            }
+            core.setFailed(`${reopened ? 'Issue reopened' : 'Issue could NOT be reopened'}: the gate did not finish.`);
