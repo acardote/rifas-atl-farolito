@@ -28,10 +28,10 @@ provenance = "unknown"
 [files.".github/workflows/bruno-close-gate.yml"]
 kind = "copied"
 provenance = "update"
-choice = "replace"
+choice = "keep"
 commit = "b0736b364e4e1295a411883d2f95bb49f68285fa"
 template_hash = "sha256:aa0f4db3a723cc0e59cf47c0b1244ad2831af5bf8c2ba238c3acc9c2b0c82e9e"
-hash = "sha256:aa0f4db3a723cc0e59cf47c0b1244ad2831af5bf8c2ba238c3acc9c2b0c82e9e"
+hash = "sha256:3aabbf17ecfe804ef268e2850fdd08630a71dfb1164dd95ec02049c70c5c2595"
 
 [files.".github/workflows/bruno-decisions-gate.yml"]
 kind = "copied"
