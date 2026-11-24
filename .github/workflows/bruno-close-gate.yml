@@ -1,0 +1,595 @@
+# Bruno close-gate
+#
+# Mechanically enforces SPEC §5.5 (Move 5 — Closure Against Reality):
+# a bruno-labeled issue cannot close without ALL of:
+#   - `state:reconciled` label
+#   - a `## Reconciliation` comment whose latest version contains a
+#     real provenance reference NEAR the word "Provenance" (URL,
+#     backtick-quoted ≥4-char token, or #N issue ref)
+#   - for `child` issues: a `## Falsifiers (move:4)` comment (or body)
+#   - for `child` issues: a `Parent: #<n>` reference in the issue body
+#
+# DISPOSITION BRANCH (#376 S1): an issue carrying exactly one of
+# `state:declined` / `state:superseded` (and not `state:reconciled`) is
+# closed by owner disposition instead of reconciliation. It must carry a
+# fresh, well-formed `## Owner disposition` record and be closed as
+# `not_planned`; see the branch below for the rules. Two or more
+# disposition labels, or one plus `state:reconciled`, refuse. With no
+# disposition label the reconciliation gate runs unchanged.
+#
+# SCOPE: this gate fires only for issues labeled `parent` or `child`.
+# Plain (un-bruno-labeled) issues bypass — by design.
+#
+# THREAT MODEL: this gate is honest-author defense, not adversary defense.
+#
+# Permissions required: `issues: write` (to reopen + comment + label)
+# and `pull-requests: read` (the disposition branch checks that a
+# same-repo PR cited as `#N` or `/pull/N` exists; an issues-only token
+# gets 403 from issues.get on a PR number, acardote/personal-assistant-ultra#519).
+# If `permissions:` is missing or insufficient, the API calls fail loudly
+# with "Resource not accessible" (this is intentional — see falsifier F4
+# on issue #2 of bruno-method: the workflow MUST fail loudly rather than
+# silently no-op in repos with restricted GITHUB_TOKEN scopes).
+
+name: Bruno close-gate
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  enforce-reconciliation:
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.issue.labels.*.name, 'parent') ||
+      contains(github.event.issue.labels.*.name, 'child')
+    steps:
+      - name: Enforce v0.2 reconciliation gate
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const issue_number = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+
+            const labels = (context.payload.issue.labels || []).map(l => l.name);
+            const isChild = labels.includes('child');
+            const isParent = labels.includes('parent');
+            const issueBody = context.payload.issue.body || '';
+
+            // Helper: strip fenced code AND blockquoted lines, applied uniformly.
+            const stripBody = (b) =>
+              (b || '')
+                .replace(/```[\s\S]*?```/g, '')
+                .replace(/^>.*$/gm, '');
+
+            // Refusal: comment, reopen, keep `state:*` exclusive, mark reviewing.
+            // Fail closed (#376 S1 round 2): each write is attempted even if an
+            // earlier one failed, so a failed comment still reopens. Any failed
+            // write fails the job with the error, never silently.
+            const reopenWith = async (explanation, failText) => {
+              const writeErrors = [];
+              const attempt = async (what, fn) => {
+                try { await fn(); } catch (e) { writeErrors.push(`${what} (API error: ${e.message})`); }
+              };
+              await attempt('comment', () => github.rest.issues.createComment({
+                owner, repo, issue_number, body: explanation
+              }));
+
+              await attempt('reopen', () => github.rest.issues.update({
+                owner, repo, issue_number, state: 'open'
+              }));
+
+              // S4 (#22): keep `state:*` labels mutually exclusive. Remove any
+              // existing state:* label before adding state:reviewing.
+              for (const ln of labels) {
+                if (ln.startsWith('state:') && ln !== 'state:reviewing') {
+                  try {
+                    await github.rest.issues.removeLabel({
+                      owner, repo, issue_number, name: ln,
+                    });
+                  } catch (e) {
+                    core.warning(`Could not remove ${ln}: ${e.message}`);
+                  }
+                }
+              }
+
+              await attempt('add state:reviewing', () => github.rest.issues.addLabels({
+                owner, repo, issue_number, labels: ['state:reviewing']
+              }));
+
+              core.setFailed(writeErrors.length
+                ? `${failText} The gate's own writes FAILED: ${writeErrors.join('; ')}.`
+                : failText);
+            };
+
+            // Fail closed (#376 S1 round 2): the verdict depends on the
+            // comments, so a failed read (403, 5xx, rate limit, a failed page)
+            // reopens instead of letting the close stand.
+            const reopenUnread = (e) => reopenWith([
+              `⚠️ **Bruno close-gate fired** — the gate could not read this issue's comments (API error: ${e.message}), so it cannot verify this close. A close the gate cannot verify does not stand.`,
+              '',
+              'To close again:',
+              '1. Re-apply any `state:*` label this reopen removed.',
+              '2. Close again; the gate re-reads the issue on every close.',
+              '',
+              `_The gate fired at ${new Date().toISOString()}._`
+            ].join('\n'), `Issue reopened: the gate could not read the issue's comments (API error: ${e.message}).`);
+
+            // Fetch comments fresh — F3 (issue #2): event payload may not include them.
+            // S3 race mitigation (#22): when a user closes via `gh issue close
+            // --comment "..."`, GitHub processes the close and the comment as
+            // separate operations and the close webhook can fire before the
+            // comment is in `listComments`. Sleep briefly and retry once if
+            // we don't see a `## Reconciliation` on the first read.
+            const reconRe = /^#{2,4}\s*reconciliation\b/im;
+            const fetchComments = () => github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            );
+            await new Promise(r => setTimeout(r, 3000));
+            let comments;
+            try {
+              comments = await fetchComments();
+            } catch (e) {
+              await reopenUnread(e);
+              return;
+            }
+            const stripBodyEarly = (b) =>
+              (b || '').replace(/```[\s\S]*?```/g, '').replace(/^>.*$/gm, '');
+            const seemsReconciled = comments.some(c => reconRe.test(stripBodyEarly(c.body)));
+            if (!seemsReconciled) {
+              await new Promise(r => setTimeout(r, 4000));
+              try {
+                comments = await fetchComments();
+              } catch (e) {
+                await reopenUnread(e);
+                return;
+              }
+            }
+
+            // F-gate-bot-self-reject (#27): filter bot-authored comments out
+            // of gate consideration. Defense in depth — today's gate complaint
+            // doesn't accidentally satisfy any check, but a future bot
+            // (Dependabot, Copilot, etc.) commenting with Bruno-shaped text
+            // shouldn't qualify either.
+            const isBot = (c) =>
+              (c.user && (c.user.type === 'Bot' || c.user.login === 'github-actions[bot]'));
+            comments = comments.filter(c => !isBot(c));
+
+            // Shared by Check 5 and the disposition branch's child check.
+            const parentRefRe = /(?:^|\n)\s*\*{0,2}\s*parent\s*\*{0,2}\s*:\s*#(\d+)/i;
+            const resolveParent = async (parentNum) => {
+              try {
+                const parent = await github.rest.issues.get({
+                  owner, repo, issue_number: parentNum,
+                });
+                const parentLabels = (parent.data.labels || []).map(l => typeof l === 'string' ? l : l.name);
+                if (parentLabels.includes('parent')) return '';
+                return `Parent: #${parentNum} exists but lacks the \`parent\` label (labels: ${parentLabels.join(', ') || 'none'})`;
+              } catch (e) {
+                if (e.status === 404) return `Parent: #${parentNum} does not exist`;
+                // Fail closed on other API errors — see #28 F2.
+                return `Parent: #${parentNum} could not be validated (API error: ${e.message})`;
+              }
+            };
+
+            // ---- Disposition branch (#376 S1): declined / superseded ----
+            // Engages only with exactly one disposition label and no
+            // `state:reconciled`. Two or more disposition labels, or one plus
+            // `state:reconciled`, refuse outright (no fall-through). With no
+            // disposition label, the reconciliation gate below runs unchanged.
+            const DISPOSITION_LABELS = ['state:declined', 'state:superseded'];
+            const dispLabels = labels.filter(l => DISPOSITION_LABELS.includes(l));
+            if (dispLabels.length > 0) {
+              const dMissing = [];
+              if (dispLabels.length >= 2) {
+                dMissing.push(`exactly one disposition label (found ${dispLabels.map(l => '`' + l + '`').join(' and ')})`);
+              } else if (labels.includes('state:reconciled')) {
+                dMissing.push(`either \`${dispLabels[0]}\` or \`state:reconciled\`, not both`);
+              } else {
+                const disposition = dispLabels[0].slice('state:'.length);
+                const dispHeadingRe = /^#{2,4}\s*owner disposition\b/im;
+                // A record is what a reader sees: drop ``` and ~~~ fences (an
+                // unclosed fence runs to the end), HTML comments and blockquotes.
+                const stripRecord = (b) => (b || '')
+                  .replace(/<!--[\s\S]*?(?:-->|$(?![\s\S]))/g, '')
+                  .replace(/^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n?[\s\S]*?(?:^[ \t]{0,3}\1[`~]*[ \t]*$|(?![\s\S]))/gm, '')
+                  .replace(/^[ \t]{0,3}>.*$/gm, '');
+                const latestRecord = (cs) => cs
+                  .filter(c => dispHeadingRe.test(stripRecord(c.body)))
+                  .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                // Freshness: the record must postdate the latest `reopened`
+                // event, whoever reopened it (a person or this gate).
+                let lastReopen = null;
+                let eventsError = '';
+                try {
+                  const events = await github.paginate(
+                    github.rest.issues.listEvents,
+                    { owner, repo, issue_number, per_page: 100 }
+                  );
+                  for (const ev of events) {
+                    if (ev.event === 'reopened' && (!lastReopen || new Date(ev.created_at) > new Date(lastReopen))) {
+                      lastReopen = ev.created_at;
+                    }
+                  }
+                } catch (e) {
+                  eventsError = `the issue's events could not be read to check record freshness (API error: ${e.message})`;
+                }
+                const isFresh = (r) => !lastReopen || new Date(r.created_at) > new Date(lastReopen);
+
+                let record = latestRecord(comments);
+                if (!record || !isFresh(record)) {
+                  // Same race as S3 (#22): a close with --comment can fire first.
+                  await new Promise(r => setTimeout(r, 4000));
+                  try {
+                    comments = (await fetchComments()).filter(c => !isBot(c));
+                  } catch (e) {
+                    await reopenUnread(e);
+                    return;
+                  }
+                  record = latestRecord(comments);
+                }
+
+                if (eventsError) dMissing.push(eventsError);
+                if (!record) {
+                  dMissing.push('an `## Owner disposition` record comment (non-bot)');
+                } else {
+                  if (!eventsError && !isFresh(record)) {
+                    dMissing.push(`an \`## Owner disposition\` record posted after the latest reopen (${lastReopen}); the latest record predates it`);
+                  }
+                  const text = stripRecord(record.body);
+                  const fieldRe = (name) => new RegExp(
+                    `^[ \\t]*(?:[-*][ \\t]+)?\\*{0,2}${name}\\*{0,2}[ \\t]*:[ \\t]*\\*{0,2}[ \\t]*(.*)$`, 'gim');
+                  const values = (name) => [...text.matchAll(fieldRe(name))].map(m => m[1].trim());
+                  const first = (name) => values(name)[0] || '';
+                  const dispValue = first('disposition').toLowerCase();
+                  const dispWord = (dispValue.match(/^(declined|superseded)\b/) || [])[1] || '';
+                  if (!dispWord) {
+                    dMissing.push('a `Disposition: declined` or `Disposition: superseded` line in the record');
+                  } else if (dispWord !== disposition) {
+                    dMissing.push(`a record whose \`Disposition: ${dispWord}\` matches the \`${dispLabels[0]}\` label`);
+                  }
+                  if (!first("owner['’]s chosen option")) dMissing.push("a non-empty `Owner's chosen option:` line in the record");
+                  if (!/^(?:"[^"]*\S[^"]*"|“[^”]*\S[^”]*”)/.test(first("owner['’]s words"))) {
+                    dMissing.push("an `Owner's words:` line with the owner's decision as a non-empty double-quoted string");
+                  }
+                  if (!first('reason')) dMissing.push('a non-empty `Reason:` line in the record');
+                  // References. Accepted shapes: a GitHub issue / PR URL (with an
+                  // optional comment or review anchor), a GitHub commit / blob /
+                  // tree URL at a sha, `owner/repo#N`, `#N`, and `<sha>:<path>`.
+                  // Issue refs in THIS repo must resolve (issues.get; 404 refuses,
+                  // other errors fail closed). A 403 on issues.get is how a PR
+                  // number answers a token without pull-requests read, so a 403
+                  // is retried once with pulls.get: only a successful read
+                  // passes, and any failure of that retry refuses as "could not
+                  // be resolved" (the 403 proved nothing). Refs into another repo
+                  // (`Provenance:` and `Superseded-by:` alike) are taken by shape
+                  // with no read, since the workflow token cannot read private
+                  // repos.
+                  // LIMIT (#519): a shape-only target is not proven to exist. A
+                  // private repo and a nonexistent issue both answer 404 to this
+                  // token, so a typo'd or invented `owner/repo#N` in another repo
+                  // stands. This is the honest-mistake guard the owner chose
+                  // (acardote/personal-assistant-ultra#376, comment 7053342959),
+                  // not adversary defense. Likewise an old name of this repo
+                  // (before a rename or transfer) cannot be recognised without a
+                  // read, so it counts as another repo.
+                  // Every ref is normalised before the same-repo and self checks:
+                  // a trailing `.git` is dropped and case is ignored, so
+                  // `owner/repo.git#N` is this repo.
+                  const mkRef = (o, r, n) => ({ o, r: r.replace(/\.git$/i, ''), n: parseInt(n, 10) });
+                  const thisRepo = `${owner}/${repo}`.toLowerCase();
+                  const sameRepo = (ref) => `${ref.o}/${ref.r}`.toLowerCase() === thisRepo;
+                  // GitHub's grammar, enforced on a target taken by shape: owner
+                  // 1-39 of [A-Za-z0-9-] with no leading or trailing hyphen; repo
+                  // 1-100 of [A-Za-z0-9._-], not `.` or `..`; number 1..2^31-1.
+                  const validShape = (ref) =>
+                    /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(ref.o)
+                    && /^[A-Za-z0-9._-]{1,100}$/.test(ref.r) && ref.r !== '.' && ref.r !== '..'
+                    && Number.isSafeInteger(ref.n) && ref.n >= 1 && ref.n <= 2147483647;
+                  const isSelf = (ref) => sameRepo(ref) && ref.n === issue_number;
+                  const refName = (ref) => (sameRepo(ref) ? '' : `${ref.o}/${ref.r}`) + `#${ref.n}`;
+                  const resolved = {};
+                  const resolveIssue = async (ref) => {
+                    const key = `${ref.o}/${ref.r}#${ref.n}`.toLowerCase();
+                    if (!(key in resolved)) {
+                      let err = null;
+                      try {
+                        await github.rest.issues.get({ owner: ref.o, repo: ref.r, issue_number: ref.n });
+                      } catch (e) { err = e; }
+                      if (err && err.status === 403) {
+                        const first = err;
+                        try {
+                          await github.rest.pulls.get({ owner: ref.o, repo: ref.r, pull_number: ref.n });
+                          err = null;
+                        } catch (e) {
+                          err = { message: `${first.message}; as a PR: ${e.message}` };
+                        }
+                      }
+                      resolved[key] = !err ? ''
+                        : err.status === 404 ? `${refName(ref)} does not exist`
+                        : `${refName(ref)} could not be resolved (API error: ${err.message})`;
+                    }
+                    return resolved[key];
+                  };
+                  const refsIn = (v) => {
+                    const refs = [];
+                    let rest = (v || '')
+                      .replace(/https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+)(?:#(?:issuecomment-|discussion_r|pullrequestreview-)\d+)?(?![\w\/-])/gi,
+                        (m, o, r, n) => { refs.push(mkRef(o, r, n)); return ' '; })
+                      .replace(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:commit|blob|tree)\/[0-9a-f]{7,40}(?![0-9a-z])[^\s`)>]*/gi,
+                        () => { refs.push(null); return ' '; })
+                      .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, ' ');   // any other URL: no reference
+                    rest = rest
+                      .replace(/(?<![\w\/.-])([\w.-]+)\/([\w.-]+)#(\d+)(?!\d)/g,
+                        (m, o, r, n) => { refs.push(mkRef(o, r, n)); return ' '; })
+                      .replace(/(?<![\w\/.-])[0-9a-f]{7,40}:(?![\/~])[\w.\/-]*\w/gi,
+                        () => { refs.push(null); return ' '; })
+                      .replace(/(?<![\w\/.&-])#(\d+)(?!\d)/g,
+                        (m, n) => { refs.push({ o: owner, r: repo, n: parseInt(n, 10) }); return ' '; });
+                    return { refs: refs.filter(Boolean), any: refs.length > 0, rest };
+                  };
+
+                  if (disposition === 'superseded') {
+                    const sb = first('superseded-by');
+                    const m = sb.match(/^(?:#(\d+)|([\w.-]+)\/([\w.-]+)#(\d+)|https?:\/\/(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+))(?![\w\/-])/i);
+                    if (!m) {
+                      dMissing.push('a `Superseded-by:` line with `#N`, `owner/repo#N` or an issue URL');
+                    } else {
+                      const ref = m[1] ? mkRef(owner, repo, m[1])
+                        : m[4] ? mkRef(m[2], m[3], m[4])
+                        : mkRef(m[5], m[6], m[7]);
+                      if (isSelf(ref)) {
+                        dMissing.push(`a \`Superseded-by:\` target other than this issue (#${issue_number})`);
+                      } else if (sameRepo(ref)) {
+                        const d = await resolveIssue(ref);
+                        if (d) dMissing.push(`a \`Superseded-by:\` target that exists (${d})`);
+                      } else if (!validShape(ref)) {
+                        // A target in another repo is taken by shape (no read),
+                        // so the shape must be one GitHub can have.
+                        dMissing.push(`a \`Superseded-by:\` target in another repo with a valid GitHub \`owner/repo#N\` (${ref.o}/${ref.r}#${m[4] || m[7]} is not one)`);
+                      }
+                    }
+                  }
+
+                  // Source rule, negative half: a session, a local path, a bare
+                  // file name or a self-citation (in any form) is not a reference.
+                  const sourceBreaks = (v) => {
+                    const { refs, rest } = refsIn(v);
+                    const why = [];
+                    if (/(?:^|[^\w.-])(?:\/|~\/|\$\{?TMPDIR\}?\/?)?(?:Users|home|root|private|var|tmp|temp)\/|~\/|\$\{?TMPDIR\b|scratchpad/i.test(rest)) why.push('a filesystem path');
+                    if (/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i.test(v)
+                        || /\bsession\b[\s:#-]*(?:id\b[\s:#-]*)?[0-9a-f]{6,}\b/i.test(rest)) why.push('a session id');
+                    if (/[\w-]\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|csv|log|html?)\b/i.test(rest)) why.push('a bare file name');
+                    if (refs.some(isSelf)) why.push(`a self-citation (#${issue_number})`);
+                    return why;
+                  };
+                  // Positive half: a kept Provenance line names at least one
+                  // accepted reference, and every same-repo issue ref resolves.
+                  const provenanceProblems = async (v) => {
+                    const why = sourceBreaks(v);
+                    if (why.length) return why;
+                    const { refs, any } = refsIn(v);
+                    if (!any) return ['no accepted reference (a GitHub issue/PR/comment/commit URL, `owner/repo#N`, `#N` or `<sha>:<path>`)'];
+                    for (const ref of refs.filter(sameRepo)) {
+                      const d = await resolveIssue(ref);
+                      if (d) return [d];
+                    }
+                    return [];
+                  };
+                  const given = first('given');
+                  if (!/^\d{4}-\d{2}-\d{2}[ \t]*,[ \t]*\S/.test(given)) {
+                    dMissing.push('a `Given:` line with an ISO date, a comma and the channel in plain words');
+                  } else if (sourceBreaks(given).length) {
+                    dMissing.push(`a \`Given:\` line without ${sourceBreaks(given).join(', ')} (the source rule)`);
+                  }
+                  // Pinned rule (#376): refused lines are dropped, and at least
+                  // one Provenance line must remain.
+                  const provs = values('provenance');
+                  const refused = [];
+                  let kept = 0;
+                  for (const v of provs) {
+                    const why = await provenanceProblems(v);
+                    if (why.length) refused.push(why.join(', ')); else kept++;
+                  }
+                  if (kept === 0) {
+                    dMissing.push('at least one `Provenance:` line with a reference that passes the source rule'
+                      + (refused.length ? ` (refused: ${refused.join('; ')})` : ''));
+                  }
+                }
+
+                // Close reason: declined and superseded both close as not planned.
+                const reason = context.payload.issue.state_reason || '';
+                if (reason !== 'not_planned') {
+                  dMissing.push(`the close reason \`not_planned\` (this close was \`${reason || 'unset'}\`; a disposition is never \`completed\`)`);
+                }
+
+                // Child: no Falsifiers check; a Parent line, if present, must resolve.
+                if (isChild) {
+                  const match = stripBody(issueBody).match(parentRefRe);
+                  if (match) {
+                    const detail = await resolveParent(parseInt(match[1], 10));
+                    if (detail) dMissing.push(detail);
+                  }
+                }
+
+                // Parent: no disposition close over open children.
+                if (isParent) {
+                  try {
+                    const open = await github.paginate(
+                      github.rest.issues.listForRepo,
+                      { owner, repo, state: 'open', per_page: 100 }
+                    );
+                    const kids = open
+                      .filter(i => !i.pull_request && i.number !== issue_number)
+                      .filter(i => {
+                        const m = stripBody(i.body).match(parentRefRe);
+                        return m && parseInt(m[1], 10) === issue_number;
+                      })
+                      .map(i => `#${i.number}`);
+                    if (kids.length) dMissing.push(`no open children (open: ${kids.join(', ')})`);
+                  } catch (e) {
+                    dMissing.push(`a check for open children (API error: ${e.message})`);
+                  }
+                }
+              }
+
+              if (dMissing.length === 0) {
+                core.info(`Bruno close-gate — owner disposition (${dispLabels[0]}) record checked; close stands.`);
+                return;
+              }
+
+              await reopenWith([
+                `⚠️ **Bruno close-gate fired** — a disposition close (\`state:declined\` / \`state:superseded\`) requires ALL of: ${dMissing.join('; ')}.`,
+                '',
+                'A disposition close is not a delivery: it needs a fresh `## Owner disposition` record (`Disposition:`, `Owner\'s chosen option:`, `Owner\'s words: "<verbatim>"`, `Given: <YYYY-MM-DD>, <channel>`, `Reason:`, `Superseded-by:` when superseded, and a `Provenance:` line naming a GitHub issue/PR/comment/commit URL, `owner/repo#N`, an existing `#N` or `<sha>:<path>`, and no session, local path, bare file name or this issue), exactly one disposition label, and the close reason `not_planned`.',
+                '',
+                'To close by owner disposition:',
+                '1. Address each missing item above (post a new record if the latest one is stale or malformed).',
+                '2. Re-apply the disposition label (this reopen removed it).',
+                '3. Close again as not planned.',
+                '',
+                `_The gate fired at ${new Date().toISOString()}._`
+              ].join('\n'), `Issue reopened: disposition close missing ${dMissing.join('; ')}.`);
+              return;
+            }
+
+            // ---- Check 1: at least one `## Reconciliation` heading ----
+            // F5: tolerant — ##/###/####, any case. Apply uniform strip
+            // so a quoted/fenced reconciliation in unrelated comments
+            // doesn't shadow a real one (#15 Finding I2).
+            const reconHeadingRe = /^#{2,4}\s*reconciliation\b/im;
+            const reconComments = comments
+              .filter(c => reconHeadingRe.test(stripBody(c.body)))
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const hasReconciliation = reconComments.length > 0;
+
+            // ---- Check 2: state:reconciled label (C3 from #6) ----
+            const hasReconciledLabel = labels.includes('state:reconciled');
+
+            // ---- Check 2.5 (v0.3): multi-author actor check ----
+            // Per #31: the latest reconciliation comment's author must be
+            // - an issue assignee, OR
+            // - have push permission on the repo (admin/maintain/write), OR
+            // - be the issue creator AND assignees is empty (F1 of #31), OR
+            // - the issue carries the `allow-third-party-reconcile`
+            //   escape-hatch label.
+            // Bot comments are already filtered upstream.
+            let actorOK = !hasReconciliation;
+            let actorDetail = '';
+            const escapeLabel = labels.includes('allow-third-party-reconcile');
+            if (hasReconciliation && !escapeLabel) {
+              const latest = reconComments[0];
+              const author = latest.user && latest.user.login;
+              const assignees = (context.payload.issue.assignees || []).map(a => a.login);
+              const issueCreator = context.payload.issue.user && context.payload.issue.user.login;
+              if (assignees.includes(author)) {
+                actorOK = true;
+              } else if (assignees.length === 0 && author === issueCreator) {
+                // F1 mitigation: forgot to self-assign; author == creator is OK.
+                actorOK = true;
+              } else {
+                try {
+                  const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: author,
+                  });
+                  const level = perm.data.permission;  // admin|maintain|write|triage|read|none
+                  if (['admin', 'maintain', 'write'].includes(level)) {
+                    actorOK = true;
+                  } else {
+                    actorDetail = `latest \`## Reconciliation\` author \`${author}\` is not an assignee and has \`${level}\` permission (need write or higher)`;
+                  }
+                } catch (e) {
+                  actorDetail = `latest \`## Reconciliation\` author \`${author}\` could not be permission-checked (API error: ${e.message})`;
+                }
+              }
+            } else if (escapeLabel) {
+              core.info('allow-third-party-reconcile label present; skipping actor check.');
+              actorOK = true;
+            }
+
+            // ---- Check 3 (NEW v0.2): latest reconciliation has provenance ----
+            // Tightened (#15 Critical Finding 1): require Provenance keyword
+            // AND a meaningful reference NEAR it (within 500 chars window).
+            // Reference = URL OR backtick-quoted ≥4 chars OR #N issue ref.
+            // Sentinels like `TBD` (3 chars) won't satisfy.
+            let provenanceOK = false;
+            if (hasReconciliation) {
+              const latest = reconComments[0];
+              const stripped = stripBody(latest.body);
+              const provIdx = stripped.search(/\bprovenance\b/i);
+              if (provIdx >= 0) {
+                const window = stripped.slice(provIdx, provIdx + 500);
+                provenanceOK =
+                  /https?:\/\/\S+/.test(window)
+                  // Backtick-quoted content of ≥4 non-whitespace, non-backtick chars.
+                  // Permissive enough to accept paths with `~` (e.g. `~/path/file`),
+                  // section headings (with spaces, captured separately below), commit
+                  // SHAs, run ids, etc. Rejects empty backticks and short sentinels.
+                  || /`[^`\s][^`]{2,}[^`\s]`/.test(window)
+                  || /#\d+/.test(window);
+              }
+            }
+
+            // ---- Check 4 (v0.2 / v0.3): for `child` issues, ≥1 `## Falsifiers` heading ----
+            // v0.3 (#26): accept the heading in either the issue BODY or any comment.
+            // The `(move:4)` suffix is optional (the bruno-child issue template uses
+            // bare `## Falsifiers`; `/bruno falsify` produces `## Falsifiers (move:4)`).
+            // Both are valid Move-4 evidence.
+            const falsifiersRe = /^#{2,4}\s*falsifiers\b/im;
+            const hasFalsifiers = !isChild || (
+              falsifiersRe.test(stripBody(issueBody))
+              || comments.some(c => falsifiersRe.test(stripBody(c.body)))
+            );
+
+            // ---- Check 5 (v0.2 / v0.3): for `child` issues, body contains Parent: #N ----
+            // v0.3 (#28): API-validate the referenced issue exists AND has the
+            // `parent` label. Structural-only check accepted Parent: #999999
+            // and other nonsense.
+            let hasParentRef = !isChild;
+            let parentRefDetail = '';
+            if (isChild) {
+              const match = stripBody(issueBody).match(parentRefRe);
+              if (!match) {
+                parentRefDetail = 'no `Parent: #<n>` reference in body';
+              } else {
+                parentRefDetail = await resolveParent(parseInt(match[1], 10));
+                hasParentRef = parentRefDetail === '';
+              }
+            }
+
+            const allOK = hasReconciliation && hasReconciledLabel && provenanceOK
+                          && hasFalsifiers && hasParentRef && actorOK;
+
+            if (allOK) {
+              core.info('Bruno close-gate v0.2 — all checks passed; close stands.');
+              return;
+            }
+
+            const missing = [];
+            if (!hasReconciliation) missing.push('a `## Reconciliation` comment');
+            if (!hasReconciledLabel) missing.push('the `state:reconciled` label');
+            if (hasReconciliation && !provenanceOK) missing.push('at least one non-empty `Provenance:` line in the latest `## Reconciliation` comment');
+            if (!hasFalsifiers) missing.push('a `## Falsifiers (move:4)` comment (children must show Move-4 work)');
+            if (!hasParentRef) missing.push(parentRefDetail || 'a `Parent: #<n>` reference in the issue body (children must link to a parent)');
+            if (!actorOK) missing.push(actorDetail || 'reconciliation comment author must be an assignee or have push permission (or apply `allow-third-party-reconcile`)');
+
+            const explanation = [
+              `⚠️ **Bruno close-gate fired** — closure requires ALL of: ${missing.join('; ')}.`,
+              '',
+              'Per [SPEC §5.5](https://github.com/acardote/bruno-method/blob/main/SPEC.md#55-move-5--closure-against-reality), an issue cannot close without reconciling acceptance against landed state. v0.2 additionally requires evidence of Move-4 (falsifiers) and parent linkage for children.',
+              '',
+              'To proceed:',
+              '1. Address each missing item above.',
+              '2. Run `/bruno reconcile` (which posts the comment AND adds `state:reconciled` only when all criteria match with non-empty provenance).',
+              '3. Close again.',
+              '',
+              `_The gate fired at ${new Date().toISOString()}._`
+            ].join('\n');
+
+            await reopenWith(explanation, `Issue reopened: missing ${missing.join('; ')}.`);
