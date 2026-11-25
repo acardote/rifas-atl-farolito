@@ -18,7 +18,7 @@ through the `sanitize` function below first.
 |---|---|---|---|
 | 1. Admin (everyday admin, O8) | user `rifas-admin`; AWS managed `AdministratorAccess`; customer managed `rifas-admin-require-mfa` | `infra/iam/admin-require-mfa.json` | console password + virtual MFA. Used in the console and CloudShell. **No access key.** |
 | 2. Agent read-only | user `rifas-readonly`; customer managed `rifas-readonly-s3` | `infra/iam/readonly-agent.json` | one access key, kept only in the agents' config files |
-| 3. Owner deploy | user `rifas-deploy` with customer managed `rifas-deploy-assume`; role `rifas-deploy-role` with trust policy and customer managed `rifas-deploy-s3` | `infra/iam/deploy-user-assume-role.json`, `infra/iam/deploy-role-trust.json`, `infra/iam/deploy-role-permissions.json` | one access key, **Inactive between deploy windows**, + virtual MFA; S3 access only through an MFA role session of 15 minutes |
+| 3. Owner deploy | user `rifas-deploy` with customer managed `rifas-deploy-assume`; role `rifas-deploy-role` with trust policy and customer managed `rifas-deploy-s3` | `infra/iam/deploy-user-assume-role.json`, `infra/iam/deploy-role-trust.json`, `infra/iam/deploy-role-permissions.json` | one access key, **Inactive between deploy windows**, + virtual MFA; S3 access only through an MFA role session (session up to 30 minutes; writes only while the MFA is under 15 minutes old) |
 
 ### Why the deploy identity is a user plus a role
 
@@ -136,9 +136,15 @@ Sign in to the console as root with MFA. Switch the region selector to
 root session's temporary credentials; no access key is created. IAM is global,
 so the region only decides where CloudShell runs.
 
-If CloudShell is not offered to the root user, do step A2 in the console, sign
-out of root, then run A3 to A6 from CloudShell signed in as `rifas-admin` with
-MFA (keys are made in the console in A5 either way).
+If CloudShell is not offered to the root user, do step A2 in the console as
+root: before creating the policy, render `infra/iam/admin-require-mfa.json` by
+hand (replace each `<ACCOUNT_ID>` with the 12-digit account ID shown in the
+console account menu) and paste the result into the policy JSON editor; create
+the user, attach both policies, and do A2's console steps there. Then sign out
+of root, open CloudShell signed in as `rifas-admin` with MFA, run A1 in full as
+`rifas-admin` (it sets `$R` and `ACCOUNT_ID` and renders the policies; the root
+access-key check still applies to the account), skip A2, then run A3 to A6
+(keys are made in the console in A5 either way).
 
 ### A1. Root state and placeholder rendering
 
@@ -170,6 +176,7 @@ for f in "$R"/*.json; do python3 -m json.tool "$f" >/dev/null && echo "valid $f"
 ### A2. Identity 1: admin IAM user with MFA
 
 ```bash
+: "${R:?}" "${ACCOUNT_ID:?}"   # set by A1; if unset, run A1 first
 aws iam create-user --user-name rifas-admin
 aws iam attach-user-policy --user-name rifas-admin \
   --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
@@ -200,6 +207,7 @@ aws iam list-access-keys --user-name rifas-admin --query 'length(AccessKeyMetada
 ### A3. Identity 2: agent read-only user
 
 ```bash
+: "${R:?}" "${ACCOUNT_ID:?}"   # set by A1; if unset, run A1 first
 aws iam create-user --user-name rifas-readonly
 aws iam create-policy --policy-name rifas-readonly-s3 \
   --description "Agent read-only for bucket rifas-atl-farolito" \
@@ -215,6 +223,7 @@ No console password and no MFA for this user. Its access key is created in A5.
 The user must exist before the role, because the trust policy names it.
 
 ```bash
+: "${R:?}" "${ACCOUNT_ID:?}"   # set by A1; if unset, run A1 first
 aws iam create-user --user-name rifas-deploy
 aws iam create-policy --policy-name rifas-deploy-assume \
   --description "Deploy user: assume rifas-deploy-role with MFA only" \
@@ -240,8 +249,11 @@ aws iam attach-role-policy --role-name rifas-deploy-role \
 ```
 
 `--max-session-duration 3600` is the IAM minimum (1 hour); the profile in B1
-asks for 900 seconds (15 minutes), and the policy's `aws:MultiFactorAuthAge`
-cap enforces the same 15 minutes on the AWS side.
+asks for 1800 seconds (30 minutes, within D-0002's short-lived session of 15
+to 60 minutes), and the policy's `aws:MultiFactorAuthAge` cap denies every S3
+action once the MFA code is 15 minutes old. The profile does not ask for 900:
+the CLI treats a cached role session with under 15 minutes left as expired, so
+a 900-second session would prompt for MFA again in every new `aws` process.
 
 Console step: IAM > Users > `rifas-deploy` > Security credentials >
 **Assign MFA device** > Authenticator app, device name e.g.
@@ -405,7 +417,7 @@ DEPLOY_MFA='<paste the rifas-deploy MFA device ARN copied in A4>'
 aws configure set role_arn          "arn:aws:iam::${ACCOUNT_ID}:role/rifas-deploy-role" --profile rifas-deploy
 aws configure set source_profile    rifas-deploy-keys   --profile rifas-deploy
 aws configure set mfa_serial        "$DEPLOY_MFA"       --profile rifas-deploy
-aws configure set duration_seconds  900                 --profile rifas-deploy
+aws configure set duration_seconds  1800                --profile rifas-deploy
 aws configure set role_session_name rifas-deploy-owner  --profile rifas-deploy
 aws configure set region            eu-west-1           --profile rifas-deploy
 
@@ -434,7 +446,7 @@ output = json
 role_arn = arn:aws:iam::<ACCOUNT_ID>:role/rifas-deploy-role
 source_profile = rifas-deploy-keys
 mfa_serial = arn:aws:iam::<ACCOUNT_ID>:mfa/rifas-deploy-mfa
-duration_seconds = 900
+duration_seconds = 1800
 role_session_name = rifas-deploy-owner
 region = eu-west-1
 
@@ -550,8 +562,11 @@ aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" 
 probe_versions   # Expected: versions 1, markers 0
 ```
 
-Note the time: the session and the MFA-age cap both end 15 minutes after the
-MFA prompt.
+Note the time. Writes are allowed for about 15 minutes after the MFA prompt
+(the `aws:MultiFactorAuthAge` cap). The role session lasts up to 30 minutes,
+but writes are denied once the MFA is 15 minutes old, and from that point the
+CLI also treats the cached session as expired and asks for MFA again. Run V5
+promptly after V4.
 
 If the role session is created (first command shows the assumed role) but the
 put is `AccessDenied` with "no identity-based policy allows", the likely cause
@@ -565,7 +580,8 @@ live policy by hand.
 ```bash
 aws s3api list-object-versions --bucket "$BUCKET" --profile rifas-deploy \
   --query 'length(Versions || `[]`)'
-# Expected: ALLOWED, prints a number (no MFA prompt while the session is cached).
+# Expected: ALLOWED, prints a number (no MFA prompt if run within about 15
+# minutes of the V4 prompt, while the cached session is reused).
 ```
 
 ### V7 (F7): read-only identity cannot write (run before V6, while the probe object exists)
@@ -597,19 +613,26 @@ rm -rf ~/.aws/cli/cache ~/.aws/login/cache
 notty aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" \
   --profile rifas-deploy
 echo "exit code: $?"
-# Expected: DENIED: no MFA prompt appears on your terminal, the command exits
-# non-zero (the MFA prompt gets end-of-file), and nothing is written. PROBE.
+# Expected: DENIED. The prompt text "Enter MFA code for ..." is printed (with
+# no terminal, getpass falls back: it may also print a GetPassWarning), then
+# the prompt gets end-of-file: an EOFError and/or a non-zero exit code. No
+# code can be typed, and nothing is written. PROBE.
 probe_versions   # Expected: still versions 1, markers 0
 ```
 
-If an `Enter MFA code` prompt does appear on your terminal, do not type a code:
-press Ctrl-C, and record the check as not valid.
+The printed prompt text is expected and does not invalidate the check; the
+terminal control above is what proves no code could be entered. If the
+command instead waits for input, do not type a code: press Ctrl-C, and record
+the check as not valid. The check passes on: prompt text, then EOFError or a
+non-zero exit code, and an unchanged `probe_versions`.
 
 Expiry variant (optional, same falsifier): instead of clearing the cache, wait
 more than 15 minutes after the V4 MFA prompt, then run the same `notty aws
-s3api put-object ...` command. Expected: the same denial and an unchanged
-`probe_versions`. (After expiry the CLI tries to assume the role again, which
-needs a new MFA code; with no terminal it gets end-of-file.)
+s3api put-object ...` command. Expected: the same result (prompt text, then
+EOFError or a non-zero exit) and an unchanged `probe_versions`. (Once the
+cached session has under 15 minutes left the CLI tries to assume the role
+again, which needs a new MFA code; with no terminal it gets end-of-file. Even
+a reused session would be denied, because the MFA is over 15 minutes old.)
 
 ### V8 (F8): deploy policy content
 
@@ -662,7 +685,7 @@ attached-policy, inline and group counts; V1 to V7 commands with result lines
 (including the V6 terminal control and the V2 `aws login` result); the final
 `probe_versions`; the `InvalidClientTokenId` line after deactivation; the
 session-window check answers; and the
-`duration_seconds = 900` line of the `rifas-deploy` profile (and that the
+`duration_seconds = 1800` line of the `rifas-deploy` profile (and that the
 profile name is not `default`).
 
 ---
@@ -671,8 +694,12 @@ profile name is not `default`).
 
 1. Confirm no agent session and no agent browser automation is running.
 2. Console as `rifas-admin`: **Activate** the `rifas-deploy` access key.
-3. Run the deploy with `--profile rifas-deploy` (one MFA prompt; writes are
-   allowed for 15 minutes after it).
+3. Run the deploy with `--profile rifas-deploy`: one MFA prompt per deploy
+   window. Writes are allowed for about 15 minutes after the MFA. The role
+   session lasts up to 30 minutes, but writes are denied once the MFA is 15
+   minutes old (and a long `s3 sync` cannot refresh past that without a new
+   code). To continue after that, run step 4 and re-authenticate with a new
+   MFA code.
 4. `rm -rf ~/.aws/cli/cache ~/.aws/login/cache`
 5. Console as `rifas-admin`: **Deactivate** the `rifas-deploy` access key.
 6. **Sign out** of the admin console (or end the session in the separate admin
