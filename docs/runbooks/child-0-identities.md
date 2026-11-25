@@ -60,7 +60,18 @@ permission boundary. An agent running as your OS user can still read
 So these stay owner procedures with no mechanical check:
 
 - no agent session runs during a deploy window or an admin CLI session;
-- caches are cleared at the end of each (see "Clearing cached credentials").
+- caches are cleared at the end of each (see "Clearing cached credentials");
+- **browser sessions:** no agent browser automation runs while an admin (or
+  root) console or CloudShell session is signed in. Moving admin work to the
+  browser does not isolate it by itself: an agent's browser automation (for
+  example a Chrome extension that works inside your existing Chrome session)
+  can drive a signed-in console or CloudShell tab. So either sign out of the
+  console after each admin task, or do admin and root work only in a separate
+  browser profile that agents do not drive (and sign out there too when done).
+
+So the claim is: agents cannot write outside a deploy window, an admin CLI
+session, or a signed-in admin/root console or CloudShell session. Each of those
+windows is closed by the owner procedure above, not by a mechanical check.
 
 The AWS-enforced parts are: the deploy key is Inactive outside deploy windows,
 the deploy key alone grants no S3 action, the role requires MFA, and writes
@@ -72,7 +83,9 @@ Do admin work in the **console or CloudShell**, signed in as `rifas-admin`
 with password + MFA. `aws login` on the laptop is optional; it is used once in
 V2 to record whether it carries MFA. If you ever use the admin CLI, clear
 `~/.aws/login/cache` at the end of **every** admin CLI session, before any
-agent starts.
+agent starts. Sign out of the admin console (or close the separate admin
+browser profile's session) after **every** admin task, before any agent
+browser automation starts; see "Browser sessions" above.
 
 ### Long-term access keys
 
@@ -100,6 +113,9 @@ terminal. Rotation is in "Key rotation" below.
 - The PR that adds this runbook has been reviewed. Note the commit you will
   run: after merge, the squash commit on `main`; before merge, the reviewed
   PR head SHA. It is `<RUN_COMMIT>` below.
+- No agent browser automation runs while you are signed in to the console as
+  root or `rifas-admin` (Part A, B2, V1, V2, the end of Part B). Use a browser
+  profile that agents do not drive, or sign out before agents start.
 - No agent session runs from the start of Part B to the end of Part B (the
   deploy session sits in the CLI cache while it is valid, D-0002).
 - Probe key: `child0-probe.txt`, confirmed by the owner on 2026-11-25. Steps
@@ -321,7 +337,8 @@ rm -rf "$HOME/rifas" "$HOME/child0"
 history -c
 ```
 
-Close CloudShell and **sign out of root**. From here on root is used only for
+Close CloudShell and **sign out of root** (sign-out, not just closing the
+tab). From here on root is used only for
 root-only tasks (O6).
 
 ---
@@ -622,8 +639,20 @@ aws sts get-caller-identity --profile rifas-deploy-keys 2>&1 | tail -1
 # Expected: an InvalidClientTokenId error (the key is Inactive).
 ```
 
-Part B is complete. Agent sessions may start again only after the cache clear
-and the deactivation above.
+### Session-window check (before any agent starts again)
+
+Not mechanical; post the answers on #3 as owner-stated:
+
+1. `~/.aws/cli/cache` and `~/.aws/login/cache` do not exist
+   (`ls -d ~/.aws/cli/cache ~/.aws/login/cache 2>&1` shows "No such file").
+2. The `rifas-deploy` key shows Inactive (step above).
+3. No console or CloudShell tab is signed in as root or `rifas-admin` in any
+   browser profile an agent can drive: open the AWS console URL in that
+   profile; expected: the sign-in page, not the console home.
+4. No agent session or agent browser automation ran during Part A or Part B.
+
+Part B is complete. Agent sessions may start again only after the cache clear,
+the deactivation, the console sign-out and the check above.
 
 ### Evidence checklist for #3
 
@@ -631,7 +660,8 @@ Post, sanitized: A1 summary values; the A6 `MATCH` lines, trust `MATCH`,
 `MaxSessionDuration`, grep counts, condition list and both action lists; the
 attached-policy, inline and group counts; V1 to V7 commands with result lines
 (including the V6 terminal control and the V2 `aws login` result); the final
-`probe_versions`; the `InvalidClientTokenId` line after deactivation; and the
+`probe_versions`; the `InvalidClientTokenId` line after deactivation; the
+session-window check answers; and the
 `duration_seconds = 900` line of the `rifas-deploy` profile (and that the
 profile name is not `default`).
 
@@ -639,13 +669,16 @@ profile name is not `default`).
 
 ## Deploy window (standard procedure, for child 4 and later)
 
-1. Confirm no agent session is running.
+1. Confirm no agent session and no agent browser automation is running.
 2. Console as `rifas-admin`: **Activate** the `rifas-deploy` access key.
 3. Run the deploy with `--profile rifas-deploy` (one MFA prompt; writes are
    allowed for 15 minutes after it).
 4. `rm -rf ~/.aws/cli/cache ~/.aws/login/cache`
 5. Console as `rifas-admin`: **Deactivate** the `rifas-deploy` access key.
-6. Only then start agent sessions.
+6. **Sign out** of the admin console (or end the session in the separate admin
+   browser profile).
+7. Run the "Session-window check" (Part B). Only then start agent sessions or
+   agent browser automation.
 
 ## Clearing cached credentials
 
