@@ -22,6 +22,28 @@
           "aws:MultiFactorAuthPresent": "false"
         }
       }
+    },
+    {
+      "Sid": "DenyMfaSelfManagementOnOtherResourcesWithoutMfa",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateVirtualMFADevice",
+        "iam:EnableMFADevice",
+        "iam:GetUser",
+        "iam:GetMFADevice",
+        "iam:ListMFADevices",
+        "iam:ResyncMFADevice",
+        "iam:ChangePassword"
+      ],
+      "NotResource": [
+        "arn:aws:iam::<ACCOUNT_ID>:user/${aws:username}",
+        "arn:aws:iam::<ACCOUNT_ID>:mfa/*"
+      ],
+      "Condition": {
+        "BoolIfExists": {
+          "aws:MultiFactorAuthPresent": "false"
+        }
+      }
     }
   ]
 }

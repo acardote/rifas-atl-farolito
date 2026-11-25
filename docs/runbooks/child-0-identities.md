@@ -1,6 +1,8 @@
 # Runbook: child 0, create the three IAM identities
 
-Issue: #3 (parent #1). Decisions: O2, O6, O8 on #1; D-0002.
+Issue: #3 (parent #1). Decisions: O2, O6, O8 on #1; D-0002; owner decisions of
+2026-11-25 recorded in the PR #6 fix-up (agent config isolation, read-only keeps
+`s3:GetObjectVersion`, probe key `child0-probe.txt` confirmed).
 
 **Who runs this:** the owner only. Agents drafted this file and the policies in
 `infra/iam/`; agents run none of it and make no AWS calls.
@@ -14,9 +16,9 @@ through the `sanitize` function below first.
 
 | Identity | IAM objects | Policy file | Credentials |
 |---|---|---|---|
-| 1. Admin (everyday admin, O8) | user `rifas-admin`; AWS managed `AdministratorAccess`; customer managed `rifas-admin-require-mfa` | `infra/iam/admin-require-mfa.json` | console password + virtual MFA; CLI through `aws login`. **No access key.** |
-| 2. Agent read-only | user `rifas-readonly`; customer managed `rifas-readonly-s3` | `infra/iam/readonly-agent.json` | one access key (unavoidable, see below) |
-| 3. Owner deploy | user `rifas-deploy` with customer managed `rifas-deploy-assume`; role `rifas-deploy-role` with trust policy and customer managed `rifas-deploy-s3` | `infra/iam/deploy-user-assume-role.json`, `infra/iam/deploy-role-trust.json`, `infra/iam/deploy-role-permissions.json` | one access key + virtual MFA; S3 access only through an MFA role session of 15 minutes |
+| 1. Admin (everyday admin, O8) | user `rifas-admin`; AWS managed `AdministratorAccess`; customer managed `rifas-admin-require-mfa` | `infra/iam/admin-require-mfa.json` | console password + virtual MFA. Used in the console and CloudShell. **No access key.** |
+| 2. Agent read-only | user `rifas-readonly`; customer managed `rifas-readonly-s3` | `infra/iam/readonly-agent.json` | one access key, kept only in the agents' config files |
+| 3. Owner deploy | user `rifas-deploy` with customer managed `rifas-deploy-assume`; role `rifas-deploy-role` with trust policy and customer managed `rifas-deploy-s3` | `infra/iam/deploy-user-assume-role.json`, `infra/iam/deploy-role-trust.json`, `infra/iam/deploy-role-permissions.json` | one access key, **Inactive between deploy windows**, + virtual MFA; S3 access only through an MFA role session of 15 minutes |
 
 ### Why the deploy identity is a user plus a role
 
@@ -27,48 +29,86 @@ The AWS CLI only prompts for an MFA code and caches a short session (in
 - the user `rifas-deploy`, whose long-term key can do one thing only: call
   `sts:AssumeRole` on `rifas-deploy-role`, and only with MFA (`Bool`);
 - the role `rifas-deploy-role`, whose trust policy admits only that user with
-  MFA (`Bool`), and whose permission policy is exactly #3 Scope item 3, each
-  Allow carrying `"Bool": {"aws:MultiFactorAuthPresent": "true"}`.
+  MFA (`Bool`), and whose permission policy is exactly #3 Scope item 3. Each
+  Allow carries `"Bool": {"aws:MultiFactorAuthPresent": "true"}` and, in
+  addition, `"NumericLessThan": {"aws:MultiFactorAuthAge": "900"}`, so AWS
+  itself refuses writes more than 15 minutes after the MFA code was entered,
+  whatever session length a profile asks for.
 
-The deploy user's key on its own grants no S3 action at all. Its exposure (for
-example, read by an agent shell from `~/.aws/credentials`) gives nothing without
-the MFA device.
+**Unverified by the drafter:** that `aws:MultiFactorAuthAge` is present in a
+role session assumed with MFA. If it is absent, `NumericLessThan` does not
+match and V4 is denied. V4 tests this; if V4 fails only for that reason, see
+the note under V4.
+
+### Agent isolation (owner decision 2026-11-25)
+
+Agents get their own AWS config files, which contain **only** `rifas-readonly`:
+
+- `~/.aws-agents/config` and `~/.aws-agents/credentials`;
+- every agent session starts with
+  `AWS_CONFIG_FILE=~/.aws-agents/config AWS_SHARED_CREDENTIALS_FILE=~/.aws-agents/credentials`;
+- the admin and deploy profiles stay in your own `~/.aws`, and the read-only
+  key is **not** in `~/.aws`.
+
+What this does: an agent's CLI calls resolve only `rifas-readonly`; it cannot
+pick the deploy or admin profile by name, and an accidental `--profile
+rifas-deploy` fails because the profile does not exist in its config.
+
+What this does **not** do: it is configuration isolation, not an OS
+permission boundary. An agent running as your OS user can still read
+`~/.aws/credentials`, `~/.aws/cli/cache` and `~/.aws/login/cache` directly.
+So these stay owner procedures with no mechanical check:
+
+- no agent session runs during a deploy window or an admin CLI session;
+- caches are cleared at the end of each (see "Clearing cached credentials").
+
+The AWS-enforced parts are: the deploy key is Inactive outside deploy windows,
+the deploy key alone grants no S3 action, the role requires MFA, and writes
+need an MFA age under 15 minutes.
+
+### Admin use
+
+Do admin work in the **console or CloudShell**, signed in as `rifas-admin`
+with password + MFA. `aws login` on the laptop is optional; it is used once in
+V2 to record whether it carries MFA. If you ever use the admin CLI, clear
+`~/.aws/login/cache` at the end of **every** admin CLI session, before any
+agent starts.
 
 ### Long-term access keys
 
-- **Root:** none, ever (O6). Checked in A1 and V2.
-- **Admin:** none. CLI use goes through `aws login`, which uses the console
-  sign-in (password + MFA) and caches a short session in `~/.aws/login/cache`.
+- **Root:** none, ever (O6). Checked in A1 and A6.
+- **Admin:** none.
 - **Read-only agent identity:** one access key, unavoidable: agents run the CLI
   non-interactively and cannot answer an MFA prompt or a browser login. The key
   can only read this one bucket and list CloudFront distributions.
 - **Deploy user:** one access key, unavoidable for a CLI role profile
   (`source_profile` needs credentials) and required by falsifier F3. It grants
-  nothing without MFA (see above).
+  nothing without MFA, and it is **Inactive except during a deploy window**.
 
-Rotation guidance for both keys is in "Key rotation" below.
+Keys are created in the console (the secret is shown once), never printed in a
+terminal. Rotation is in "Key rotation" below.
 
 ## Prerequisites
 
 - Root MFA is enabled (O6) and you can sign in as root.
 - An authenticator app on your phone for two new virtual MFA devices (admin and
   deploy). They are separate entries; one app can hold both.
-- AWS CLI v2 on your laptop, recent enough to have `aws login`
-  (`aws login help` prints a help page; if it does not, update the CLI first).
-- `python3` on the laptop (used for policy comparison and nothing else).
-- The PR that adds this runbook has been reviewed. Note its reviewed commit
-  SHA; it is `<REVIEWED_COMMIT>` below.
-- No agent session is running from the moment you start Part B until the end
-  of Part B (the deploy session sits in the CLI cache while it is valid,
-  D-0002).
-- **Probe key `child0-probe.txt`: CONFIRM WITH THE OWNER FIRST.** This is open
-  question 1 on #1. Do not run any step marked PROBE until the key name is
-  confirmed. If a different key is confirmed, change `PROBE_KEY` in B0.
+- AWS CLI v2 on your laptop. For the optional V2 `aws login` check it must be
+  recent enough to have `aws login` (`aws login help` prints a help page).
+- `python3` 3.9 or later on the laptop (policy comparison and the no-terminal
+  wrapper in V6).
+- The PR that adds this runbook has been reviewed. Note the commit you will
+  run: after merge, the squash commit on `main`; before merge, the reviewed
+  PR head SHA. It is `<RUN_COMMIT>` below.
+- No agent session runs from the start of Part B to the end of Part B (the
+  deploy session sits in the CLI cache while it is valid, D-0002).
+- Probe key: `child0-probe.txt`, confirmed by the owner on 2026-11-25. Steps
+  that write to it are marked PROBE.
 
-Sanitizer for anything you post (replaces every 12-digit number):
+Sanitizer for anything you post (account IDs and access key IDs):
 
 ```bash
-sanitize() { sed -E 's/[0-9]{12}/<ACCOUNT_ID>/g'; }
+sanitize() { sed -E -e 's/[0-9]{12}/<ACCOUNT_ID>/g' -e 's/A[SK]IA[A-Z0-9]{16}/<KEY_ID>/g'; }
 ```
 
 ---
@@ -80,15 +120,14 @@ Sign in to the console as root with MFA. Switch the region selector to
 root session's temporary credentials; no access key is created. IAM is global,
 so the region only decides where CloudShell runs.
 
-If CloudShell is not offered to the root user, do the same steps in the IAM
-console (each CLI step below names the console equivalent in a comment), or do
-step A2 in the console, then run A3 to A6 as `rifas-admin` from CloudShell
-after signing in as that user with MFA.
+If CloudShell is not offered to the root user, do step A2 in the console, sign
+out of root, then run A3 to A6 from CloudShell signed in as `rifas-admin` with
+MFA (keys are made in the console in A5 either way).
 
 ### A1. Root state and placeholder rendering
 
 ```bash
-sanitize() { sed -E 's/[0-9]{12}/<ACCOUNT_ID>/g'; }
+sanitize() { sed -E -e 's/[0-9]{12}/<ACCOUNT_ID>/g' -e 's/A[SK]IA[A-Z0-9]{16}/<KEY_ID>/g'; }
 
 # Root must have no access keys, and MFA must be on.
 aws iam get-account-summary \
@@ -96,7 +135,11 @@ aws iam get-account-summary \
 # Expected: AccountAccessKeysPresent 0, AccountMFAEnabled 1. If keys are present: STOP, delete them first.
 
 git clone https://github.com/acardote/rifas-atl-farolito.git "$HOME/rifas"
-cd "$HOME/rifas" && git checkout <REVIEWED_COMMIT>
+cd "$HOME/rifas"
+# After merge:
+git checkout <RUN_COMMIT>
+# Before merge, instead:  git fetch origin pull/6/head && git checkout FETCH_HEAD
+git rev-parse HEAD    # must equal <RUN_COMMIT>; if not, STOP
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 R="$HOME/child0"
@@ -115,7 +158,7 @@ aws iam create-user --user-name rifas-admin
 aws iam attach-user-policy --user-name rifas-admin \
   --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
 aws iam create-policy --policy-name rifas-admin-require-mfa \
-  --description "Deny all but MFA self-management without MFA" \
+  --description "Deny all but own MFA self-management without MFA" \
   --policy-document "file://$R/admin-require-mfa.json"
 aws iam attach-user-policy --user-name rifas-admin \
   --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/rifas-admin-require-mfa"
@@ -162,7 +205,13 @@ aws iam create-policy --policy-name rifas-deploy-assume \
   --policy-document "file://$R/deploy-user-assume-role.json"
 aws iam attach-user-policy --user-name rifas-deploy \
   --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/rifas-deploy-assume"
+```
 
+IAM changes take a few seconds to propagate. If the next `create-role` fails
+with `MalformedPolicyDocument` and "Invalid principal", the new user is not
+visible yet: wait 10 to 30 seconds and run the same command again.
+
+```bash
 aws iam create-role --role-name rifas-deploy-role \
   --description "Owner deploy role for bucket rifas-atl-farolito, MFA only" \
   --assume-role-policy-document "file://$R/deploy-role-trust.json" \
@@ -175,39 +224,37 @@ aws iam attach-role-policy --role-name rifas-deploy-role \
 ```
 
 `--max-session-duration 3600` is the IAM minimum (1 hour); the profile in B1
-asks for 900 seconds (15 minutes), so the session is between 15 and 60 minutes.
+asks for 900 seconds (15 minutes), and the policy's `aws:MultiFactorAuthAge`
+cap enforces the same 15 minutes on the AWS side.
 
 Console step: IAM > Users > `rifas-deploy` > Security credentials >
 **Assign MFA device** > Authenticator app, device name e.g.
-`rifas-deploy-mfa`. No console password for this user.
+`rifas-deploy-mfa`. No console password for this user. Copy the device's
+identifier (its ARN, shown in the MFA list) for B1; you will paste it into the
+local profile only.
 
 ```bash
 aws iam list-mfa-devices --user-name rifas-deploy --query 'length(MFADevices)'
 # Expected: 1
 ```
 
-### A5. Access keys for the read-only and deploy users
+### A5. Access keys, created in the console
 
-Create each key, copy the two values straight into the laptop prompt in B1
-(`aws configure --profile ...`, which reads them interactively and keeps them
-out of shell history), then clear the CloudShell screen. Do not save them in a
-file, a note or an issue.
+For each of `rifas-readonly` and `rifas-deploy`: IAM > Users > the user >
+Security credentials > **Create access key** > use case "Command Line
+Interface (CLI)" > confirm > Create. The secret is shown once.
 
-```bash
-aws iam create-access-key --user-name rifas-readonly \
-  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
-# -> type both values into: aws configure --profile rifas-readonly   (B1, laptop)
-clear
+- Copy the two values one at a time straight into the laptop prompt in B1
+  (`aws configure`, which reads them interactively and keeps them out of shell
+  history). Do not download the `.csv`; if you did, delete it.
+- After each paste, clear the clipboard: `pbcopy < /dev/null` (macOS).
+- Do not put the values in a file, a note or an issue.
 
-aws iam create-access-key --user-name rifas-deploy \
-  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
-# -> type both values into: aws configure --profile rifas-deploy-keys   (B1, laptop)
-clear
-```
+Then set the deploy key to **Inactive** until Part B starts: IAM > Users >
+`rifas-deploy` > Security credentials > Access keys > Actions > Deactivate.
+(Part B step B2 activates it; the end of Part B deactivates it again.)
 
-You can run the two `aws configure` key prompts of B1 on the laptop now, in between, and come back.
-
-### A6. Policy content checks (falsifier F8) and acceptance
+### A6. Policy and role checks (falsifier F8) and acceptance
 
 ```bash
 cmp_policy() {  # $1 = policy name, $2 = rendered local file
@@ -223,18 +270,30 @@ cmp_policy rifas-deploy-assume     "$R/deploy-user-assume-role.json"
 cmp_policy rifas-deploy-s3         "$R/deploy-role-permissions.json"
 # Expected: four lines ending in MATCH.
 
+# Live trust policy and session cap of the role:
+aws iam get-role --role-name rifas-deploy-role \
+  --query 'Role.AssumeRolePolicyDocument' --output json > "$R/live-trust.json"
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); print("trust", "MATCH" if a==b else "DIFFER")' \
+  "$R/live-trust.json" "$R/deploy-role-trust.json"
+aws iam get-role --role-name rifas-deploy-role --query 'Role.MaxSessionDuration'
+# Expected: trust MATCH; MaxSessionDuration 3600.
+
 # F8 specific checks on the live deploy policy:
 grep -c 'DeleteObjectVersion' "$R/live-rifas-deploy-s3.json"   # Expected: 0
 grep -c 'BoolIfExists'        "$R/live-rifas-deploy-s3.json"   # Expected: 0
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sorted(a for s in d["Statement"] for a in ([s["Action"]] if isinstance(s["Action"],str) else s["Action"])))' \
-  "$R/live-rifas-deploy-s3.json"
+actions() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sorted(a for s in d["Statement"] for a in ([s["Action"]] if isinstance(s["Action"],str) else s["Action"])))' "$1"; }
+actions "$R/live-rifas-deploy-s3.json"
 # Expected exactly: ['s3:DeleteObject', 's3:GetObject', 's3:GetObjectVersion', 's3:ListBucket', 's3:ListBucketVersions', 's3:PutObject']
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([s["Effect"]+" "+json.dumps(s["Condition"], sort_keys=True) for s in d["Statement"]])' \
+  "$R/live-rifas-deploy-s3.json"
+# Expected: two "Allow" entries, each with {"Bool": {"aws:MultiFactorAuthPresent": "true"}, "NumericLessThan": {"aws:MultiFactorAuthAge": "900"}}
 
-# Readonly action list, for the acceptance evidence:
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sorted(a for s in d["Statement"] for a in ([s["Action"]] if isinstance(s["Action"],str) else s["Action"])))' \
-  "$R/live-rifas-readonly-s3.json"
+# Readonly action list, for the acceptance evidence (13 S3 actions + cloudfront:ListDistributions):
+actions "$R/live-rifas-readonly-s3.json"
 
 # Only the expected policies are attached:
+aws iam list-attached-user-policies --user-name rifas-admin --query 'AttachedPolicies[].PolicyName'
+# Expected: ["AdministratorAccess", "rifas-admin-require-mfa"] (any order)
 aws iam list-attached-user-policies --user-name rifas-readonly --query 'AttachedPolicies[].PolicyName'
 # Expected: ["rifas-readonly-s3"]
 aws iam list-attached-user-policies --user-name rifas-deploy --query 'AttachedPolicies[].PolicyName'
@@ -242,10 +301,17 @@ aws iam list-attached-user-policies --user-name rifas-deploy --query 'AttachedPo
 aws iam list-attached-role-policies --role-name rifas-deploy-role --query 'AttachedPolicies[].PolicyName'
 # Expected: ["rifas-deploy-s3"]
 for u in rifas-admin rifas-readonly rifas-deploy; do
-  echo "$u inline: $(aws iam list-user-policies --user-name $u --query 'length(PolicyNames)')"
+  echo "$u inline: $(aws iam list-user-policies --user-name $u --query 'length(PolicyNames)') groups: $(aws iam list-groups-for-user --user-name $u --query 'length(Groups)')"
 done
 echo "role inline: $(aws iam list-role-policies --role-name rifas-deploy-role --query 'length(PolicyNames)')"
-# Expected: all 0. No groups were used: list-groups-for-user should return [] for each user.
+# Expected: all 0.
+
+# F2 (root side): root still has no access key; both MFA users have one device.
+aws iam get-account-summary --query 'SummaryMap.AccountAccessKeysPresent'     # Expected: 0
+aws iam list-mfa-devices --user-name rifas-admin  --query 'length(MFADevices)' # Expected: 1
+aws iam list-mfa-devices --user-name rifas-deploy --query 'length(MFADevices)' # Expected: 1
+aws iam list-access-keys --user-name rifas-deploy \
+  --query 'AccessKeyMetadata[].Status' --output text                          # Expected: Inactive
 ```
 
 ### A7. End the root session
@@ -256,45 +322,68 @@ history -c
 ```
 
 Close CloudShell and **sign out of root**. From here on root is used only for
-root-only tasks (O6). Everything below runs on your laptop.
+root-only tasks (O6).
 
 ---
 
 ## Part B: laptop, named profiles (never `default`)
 
-### B0. Shell hygiene
+### B0. Shell hygiene and helpers
+
+Make sure no agent session is running. Then, in your own terminal:
 
 ```bash
-unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN \
+      AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
 aws configure list-profiles   # check no existing profile uses the names below
-sanitize() { sed -E 's/[0-9]{12}/<ACCOUNT_ID>/g'; }
+sanitize() { sed -E -e 's/[0-9]{12}/<ACCOUNT_ID>/g' -e 's/A[SK]IA[A-Z0-9]{16}/<KEY_ID>/g'; }
+
+# Run a command as the agents do: only the agents' config files.
+agent_aws() {
+  AWS_CONFIG_FILE="$HOME/.aws-agents/config" \
+  AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws-agents/credentials" \
+  aws "$@"
+}
+
+# Run a command with no controlling terminal and stdin from /dev/null.
+# The CLI's MFA prompt (Python getpass) reads /dev/tty, not stdin, so a plain
+# `< /dev/null` does not stop it; this wrapper removes the terminal itself.
+notty() {
+  python3 -c '
+import os, subprocess, sys
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    r = subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL)
+    os._exit(r.returncode)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+' "$@"
+}
+
 BUCKET=rifas-atl-farolito
-PROBE_KEY=child0-probe.txt    # PROBE: confirm with owner first (open question 1 on #1)
+PROBE_KEY=child0-probe.txt    # confirmed by the owner 2026-11-25
 PROBE_FILE=$(mktemp)
 printf 'child 0 probe, safe to delete\n' > "$PROBE_FILE"
 ```
 
 ### B1. Profiles
 
-Keys (interactive prompts; region `eu-west-1`, output `json`):
+Agents' files (read-only key only):
 
 ```bash
-aws configure --profile rifas-readonly      # keys from A5, first pair
-aws configure --profile rifas-deploy-keys   # keys from A5, second pair
+mkdir -p "$HOME/.aws-agents" && chmod 700 "$HOME/.aws-agents"
+agent_aws configure --profile rifas-readonly   # keys of rifas-readonly from A5; region eu-west-1; output json
+chmod 600 "$HOME/.aws-agents/config" "$HOME/.aws-agents/credentials"
 ```
 
-Then the admin profile, and the deploy role profile. The account ID and MFA
-serial are read at run time and written only to your local `~/.aws/config`:
+Your own `~/.aws` (deploy, and optionally admin):
 
 ```bash
-aws configure set region eu-west-1 --profile rifas-admin
-aws login --profile rifas-admin     # browser opens: sign in as rifas-admin with password + MFA
+aws configure --profile rifas-deploy-keys      # keys of rifas-deploy from A5; region eu-west-1; output json
 
-ACCOUNT_ID=$(aws sts get-caller-identity --profile rifas-readonly --query Account --output text)
-DEPLOY_MFA=$(aws iam list-mfa-devices --user-name rifas-deploy --profile rifas-admin \
-  --query 'MFADevices[0].SerialNumber' --output text)
-# If that call is denied (see V2), copy the device ARN from the console instead:
-# IAM > Users > rifas-deploy > Security credentials > Multi-factor authentication.
+ACCOUNT_ID=$(agent_aws sts get-caller-identity --profile rifas-readonly --query Account --output text)
+DEPLOY_MFA='<paste the rifas-deploy MFA device ARN copied in A4>'
 
 aws configure set role_arn          "arn:aws:iam::${ACCOUNT_ID}:role/rifas-deploy-role" --profile rifas-deploy
 aws configure set source_profile    rifas-deploy-keys   --profile rifas-deploy
@@ -302,19 +391,24 @@ aws configure set mfa_serial        "$DEPLOY_MFA"       --profile rifas-deploy
 aws configure set duration_seconds  900                 --profile rifas-deploy
 aws configure set role_session_name rifas-deploy-owner  --profile rifas-deploy
 aws configure set region            eu-west-1           --profile rifas-deploy
+
+aws configure set region eu-west-1 --profile rifas-admin   # only for the optional V2 aws login check
 ```
 
-Resulting `~/.aws/config` (shape; your file has the real values, the repo never does):
+Resulting files (shape; yours have real values, the repo never does):
 
 ```ini
-[profile rifas-admin]
-region = eu-west-1
-login_session = <written by aws login>
-
+# ~/.aws-agents/config  (agents: only this profile)
 [profile rifas-readonly]
 region = eu-west-1
 output = json
 
+# ~/.aws-agents/credentials
+[rifas-readonly]
+aws_access_key_id = <KEY_ID>
+aws_secret_access_key = <SECRET>
+
+# ~/.aws/config  (owner)
 [profile rifas-deploy-keys]
 region = eu-west-1
 output = json
@@ -326,28 +420,50 @@ mfa_serial = arn:aws:iam::<ACCOUNT_ID>:mfa/rifas-deploy-mfa
 duration_seconds = 900
 role_session_name = rifas-deploy-owner
 region = eu-west-1
+
+[profile rifas-admin]
+region = eu-west-1
+login_session = <written by aws login, only if you run V2>
+
+# ~/.aws/credentials  (owner): only [rifas-deploy-keys]
 ```
 
-The two access keys sit in `~/.aws/credentials` under `[rifas-readonly]` and
-`[rifas-deploy-keys]`. There is no `[default]` section for any of these.
+No `[default]` section is created for any of these, and `rifas-readonly` is not
+in `~/.aws`. Start every agent session with:
 
-Agents use only `--profile rifas-readonly`. You use `rifas-deploy` only inside
-a deploy window. `rifas-deploy-keys` is never used directly except for probe V3.
+```bash
+export AWS_CONFIG_FILE="$HOME/.aws-agents/config"
+export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws-agents/credentials"
+export AWS_PROFILE=rifas-readonly
+```
+
+Check the isolation (expected: only `rifas-readonly` is listed, and the deploy
+profile is unknown):
+
+```bash
+agent_aws configure list-profiles
+agent_aws sts get-caller-identity --profile rifas-deploy 2>&1 | tail -1
+# Expected: an error that the profile "rifas-deploy" could not be found.
+```
+
+### B2. Open the deploy window for the probes
+
+In the console as `rifas-admin` (password + MFA): IAM > Users >
+`rifas-deploy` > Security credentials > Access keys > Actions > **Activate**.
 
 ---
 
 ## Verification (one check per falsifier in #3)
 
 Run in order. Post each command and its sanitized result (`| sanitize`) on #3
-as typed evidence. "Denied" means the command fails with `AccessDenied` (or,
-for V6, fails without writing) and the version count check shows no new
-version.
+as typed evidence. "Denied" means the command fails (`AccessDenied`, or for
+V6 a non-zero exit) **and** the version count shows no new version.
 
 Helper, used to prove whether a write happened (read-only identity):
 
 ```bash
 probe_versions() {
-  aws s3api list-object-versions --bucket "$BUCKET" --prefix "$PROBE_KEY" --profile rifas-readonly \
+  agent_aws s3api list-object-versions --bucket "$BUCKET" --prefix "$PROBE_KEY" --profile rifas-readonly \
     --query '{versions: length(Versions || `[]`), markers: length(DeleteMarkers || `[]`)}'
 }
 probe_versions   # baseline. Expected: versions 0, markers 0
@@ -356,31 +472,43 @@ probe_versions   # baseline. Expected: versions 0, markers 0
 ### V1 (F1): no identity resolves to root
 
 ```bash
-for p in rifas-admin rifas-readonly rifas-deploy-keys; do
-  echo "$p: $(aws sts get-caller-identity --profile $p --query Arn --output text | sanitize)"
-done
+echo "rifas-readonly: $(agent_aws sts get-caller-identity --profile rifas-readonly --query Arn --output text | sanitize)"
+echo "rifas-deploy-keys: $(aws sts get-caller-identity --profile rifas-deploy-keys --query Arn --output text | sanitize)"
 ```
 
-Expected (allowed): `rifas-admin` shows `arn:aws:iam::<ACCOUNT_ID>:user/rifas-admin`,
-`rifas-readonly` shows `...:user/rifas-readonly`, `rifas-deploy-keys` shows
-`...:user/rifas-deploy`. None ends in `:root`. The deploy role session is
+Expected (allowed): `arn:aws:iam::<ACCOUNT_ID>:user/rifas-readonly` and
+`arn:aws:iam::<ACCOUNT_ID>:user/rifas-deploy`. For the admin, open CloudShell
+signed in as `rifas-admin` and run
+`aws sts get-caller-identity --query Arn --output text`; expected
+`...:user/rifas-admin`. None ends in `:root`. The deploy role session is
 checked in V4.
 
-### V2 (F2): admin has MFA, root has no access key
+### V2 (F2): admin has MFA, root has no access key; `aws login` MFA check
+
+F2 itself is checked in A6 (root) and can be re-run in CloudShell as
+`rifas-admin`:
 
 ```bash
-aws iam list-mfa-devices --user-name rifas-admin --profile rifas-admin --query 'length(MFADevices)'
-# Expected: 1
-aws iam get-account-summary --profile rifas-admin --query 'SummaryMap.AccountAccessKeysPresent'
-# Expected: 0
+aws iam list-mfa-devices --user-name rifas-admin --query 'length(MFADevices)'   # Expected: 1
+aws iam get-account-summary --query 'SummaryMap.AccountAccessKeysPresent'      # Expected: 0
 ```
 
-`get-account-summary` is not on the admin policy's no-MFA allow list, so it
-succeeding also shows that the `aws login` session carries MFA. **Not verified
-by the drafter:** if it is denied with an explicit deny from
-`rifas-admin-require-mfa`, the `aws login` session does not carry the MFA flag.
-Then use the admin from the console (and CloudShell) only, post that on #3, and
-do not loosen the policy without a new owner decision.
+`aws login` check (records whether the admin CLI is usable at all). Run it on
+the laptop with no agent session running, and clear the cache right after:
+
+```bash
+aws login --profile rifas-admin     # browser: sign in as rifas-admin with password + MFA
+aws iam get-account-summary --profile rifas-admin --query 'SummaryMap.AccountAccessKeysPresent'
+rm -rf ~/.aws/login/cache
+```
+
+`get-account-summary` is not on the admin policy's no-MFA exception list, so it
+succeeding shows that the `aws login` session carries MFA. **Unverified by
+the drafter.** Post the result on #3 before treating V2 as passed. If it is
+denied with an explicit deny from `rifas-admin-require-mfa`, the `aws login`
+session does not carry the MFA flag: keep using the admin in the console and
+CloudShell only, record that on #3, and do not loosen the policy without a new
+owner decision.
 
 ### V3 (F3): deploy user's long-term keys without MFA are denied
 
@@ -405,7 +533,15 @@ aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" 
 probe_versions   # Expected: versions 1, markers 0
 ```
 
-Note the time: the session expires 15 minutes after the MFA prompt.
+Note the time: the session and the MFA-age cap both end 15 minutes after the
+MFA prompt.
+
+If the role session is created (first command shows the assumed role) but the
+put is `AccessDenied` with "no identity-based policy allows", the likely cause
+is that `aws:MultiFactorAuthAge` is absent in the role session. Stop, post that
+on #3, and fix it through a PR that removes the `NumericLessThan` condition
+(then `create-policy-version` per "Partial rollback" below). Do not edit the
+live policy by hand.
 
 ### V5 (F5): deploy identity can list object versions
 
@@ -418,37 +554,52 @@ aws s3api list-object-versions --bucket "$BUCKET" --profile rifas-deploy \
 ### V7 (F7): read-only identity cannot write (run before V6, while the probe object exists)
 
 ```bash
-aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" --profile rifas-readonly
+agent_aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" --profile rifas-readonly
 # Expected: DENIED (AccessDenied). PROBE.
-aws s3api delete-object --bucket "$BUCKET" --key "$PROBE_KEY" --profile rifas-readonly
+agent_aws s3api delete-object --bucket "$BUCKET" --key "$PROBE_KEY" --profile rifas-readonly
 # Expected: DENIED (AccessDenied). PROBE.
 probe_versions   # Expected: still versions 1, markers 0
 ```
 
 ### V6 (F6): after the cache is cleared (or the session expires), a non-interactive put is denied
 
+First, a control that the wrapper really removes the terminal:
+
+```bash
+python3 -c 'open("/dev/tty"); print("terminal present")'
+# Expected: terminal present
+notty python3 -c 'open("/dev/tty"); print("terminal present")' 2>&1 | tail -1
+# Expected: OSError ... '/dev/tty' (no terminal inside the wrapper). If it prints
+# "terminal present", STOP: the check below would not be valid.
+```
+
+Then the check:
+
 ```bash
 rm -rf ~/.aws/cli/cache ~/.aws/login/cache
-aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" \
-  --profile rifas-deploy < /dev/null
+notty aws s3api put-object --bucket "$BUCKET" --key "$PROBE_KEY" --body "$PROBE_FILE" \
+  --profile rifas-deploy
 echo "exit code: $?"
-# Expected: DENIED: the command exits non-zero without writing, because no cached
-# session exists and the MFA prompt cannot read a code from /dev/null. PROBE.
+# Expected: DENIED: no MFA prompt appears on your terminal, the command exits
+# non-zero (the MFA prompt gets end-of-file), and nothing is written. PROBE.
 probe_versions   # Expected: still versions 1, markers 0
 ```
 
-Expiry variant (optional, same falsifier): instead of clearing, wait more than
-15 minutes after the V4 MFA prompt, then run the same `put-object ... < /dev/null`.
-Expected: same denial. Clearing `~/.aws/login/cache` also logs out
-`rifas-admin`; run `aws login --profile rifas-admin` again when you next need it.
+If an `Enter MFA code` prompt does appear on your terminal, do not type a code:
+press Ctrl-C, and record the check as not valid.
+
+Expiry variant (optional, same falsifier): instead of clearing the cache, wait
+more than 15 minutes after the V4 MFA prompt, then run the same `notty aws
+s3api put-object ...` command. Expected: the same denial and an unchanged
+`probe_versions`. (After expiry the CLI tries to assume the role again, which
+needs a new MFA code; with no terminal it gets end-of-file.)
 
 ### V8 (F8): deploy policy content
 
-Done in A6 as root. To re-run later as admin, repeat the A6 `cmp_policy` and
-`grep` block with `--profile rifas-admin` added to each `aws` call, comparing
-against the repo files after placeholder substitution. Expected: `MATCH`,
-`DeleteObjectVersion` count 0, `BoolIfExists` count 0, and the exact six-action
-list.
+Done in A6. To re-run later, open CloudShell as `rifas-admin`, repeat A1's
+clone and render steps and the A6 block. Expected: every comparison `MATCH`,
+`DeleteObjectVersion` count 0, `BoolIfExists` count 0, the exact six-action
+list, and both Allow conditions as listed.
 
 ### Probe cleanup (acceptance: `child0-probe.txt` is a delete marker)
 
@@ -461,52 +612,90 @@ rm -rf ~/.aws/cli/cache ~/.aws/login/cache
 rm -f "$PROBE_FILE"
 ```
 
-Part B is complete. Agent sessions may start again only after this cache clear.
+### Close the deploy window
+
+In the console as `rifas-admin`: IAM > Users > `rifas-deploy` > Security
+credentials > Access keys > Actions > **Deactivate**. Then:
+
+```bash
+aws sts get-caller-identity --profile rifas-deploy-keys 2>&1 | tail -1
+# Expected: an InvalidClientTokenId error (the key is Inactive).
+```
+
+Part B is complete. Agent sessions may start again only after the cache clear
+and the deactivation above.
 
 ### Evidence checklist for #3
 
-Post, sanitized: A1 summary values; A2/A4 MFA device counts; A6 `MATCH` lines,
-grep counts and both action lists; the attached-policy lists; V1 to V7 commands
-with result lines; the final `probe_versions`; and the `duration_seconds = 900`
-line of the `rifas-deploy` profile (and that the profile name is not `default`).
+Post, sanitized: A1 summary values; the A6 `MATCH` lines, trust `MATCH`,
+`MaxSessionDuration`, grep counts, condition list and both action lists; the
+attached-policy, inline and group counts; V1 to V7 commands with result lines
+(including the V6 terminal control and the V2 `aws login` result); the final
+`probe_versions`; the `InvalidClientTokenId` line after deactivation; and the
+`duration_seconds = 900` line of the `rifas-deploy` profile (and that the
+profile name is not `default`).
 
 ---
 
+## Deploy window (standard procedure, for child 4 and later)
+
+1. Confirm no agent session is running.
+2. Console as `rifas-admin`: **Activate** the `rifas-deploy` access key.
+3. Run the deploy with `--profile rifas-deploy` (one MFA prompt; writes are
+   allowed for 15 minutes after it).
+4. `rm -rf ~/.aws/cli/cache ~/.aws/login/cache`
+5. Console as `rifas-admin`: **Deactivate** the `rifas-deploy` access key.
+6. Only then start agent sessions.
+
 ## Clearing cached credentials
 
-After every deploy window, rollback, or probe run:
+After every deploy window, rollback, probe run, and every admin CLI session:
 
 ```bash
 rm -rf ~/.aws/cli/cache ~/.aws/login/cache
 ```
 
-`~/.aws/cli/cache` holds the deploy role session; `~/.aws/login/cache` holds the
-`aws login` admin session. Long-term keys in `~/.aws/credentials` are not
-affected; the deploy user's key alone grants no S3 access.
+`~/.aws/cli/cache` holds the deploy role session; `~/.aws/login/cache` holds
+an `aws login` admin session. Long-term keys in the credentials files are not
+affected; the deploy user's key alone grants no S3 access, and it is Inactive
+outside deploy windows.
 
 ## Key rotation
 
-Applies to `rifas-readonly` and `rifas-deploy` (the only users with keys). Run
-as `rifas-admin` (CLI or console). Rotate every 90 days, at once if a key may
-have been exposed, and when an agent environment that held the read-only key is
-retired.
+Applies to `rifas-readonly` and `rifas-deploy` (the only users with keys).
+Rotate every 90 days, at once if a key may have been exposed, and when an agent
+environment that held the read-only key is retired. Keys are created in the
+console as `rifas-admin` (the secret is shown once).
 
-```bash
-U=rifas-readonly   # or rifas-deploy; profile P=rifas-readonly or rifas-deploy-keys
-aws iam list-access-keys --user-name "$U" --profile rifas-admin \
-  --query 'AccessKeyMetadata[].{Id:AccessKeyId,Status:Status,Created:CreateDate}'
-aws iam create-access-key --user-name "$U" --profile rifas-admin \
-  --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text
-aws configure --profile "$P"                                  # enter the new pair
-aws sts get-caller-identity --profile "$P" --query Arn --output text | sanitize   # new key works
-aws iam update-access-key --user-name "$U" --access-key-id <OLD_KEY_ID> --status Inactive --profile rifas-admin
-# After a few days with no breakage:
-aws iam delete-access-key --user-name "$U" --access-key-id <OLD_KEY_ID> --profile rifas-admin
-```
+1. Set the user and the profile on their own lines (one pair at a time):
 
-Check use with `aws iam get-access-key-last-used --access-key-id <KEY_ID> --profile rifas-admin`.
-Optional hardening: keep the `rifas-deploy` key `Inactive` between deploy
-windows and set it `Active` at the start of each window.
+   ```bash
+   # read-only:
+   U=rifas-readonly
+   P=rifas-readonly
+   CFG=agent_aws          # the read-only key lives only in the agents' files
+   # or deploy:
+   # U=rifas-deploy
+   # P=rifas-deploy-keys
+   # CFG=aws
+   : "${U:?}" "${P:?}" "${CFG:?}"   # stops here if any is unset
+   ```
+
+2. Console as `rifas-admin`: IAM > Users > `$U` > Security credentials >
+   Access keys. Note the old key's ID and age. **Create access key** (CLI use
+   case). A user can hold two keys at once.
+3. Paste the new pair into the prompt, then clear the clipboard:
+
+   ```bash
+   "$CFG" configure --profile "$P"
+   pbcopy < /dev/null
+   "$CFG" sts get-caller-identity --profile "$P" --query Arn --output text | sanitize   # new key works
+   ```
+
+   For `rifas-deploy`, the new key must be Active for this test; deactivate it
+   again afterwards unless a deploy window is open.
+4. Console: **Deactivate** the old key. After a few days with no breakage,
+   **Delete** it. The console shows each key's "last used" time.
 
 ## Rollback / teardown
 
@@ -514,9 +703,9 @@ Use this to undo child 0, fully or per identity. The probe object's noncurrent
 version and delete marker are left in the bucket (no identity here can remove
 versions; removing them is a separate owner decision).
 
-Run identities 2 and 3 as `rifas-admin` (add `--profile rifas-admin`) or as root
-in CloudShell. Run identity 1 as root in CloudShell (an admin should not delete
-itself). Set `ACCOUNT_ID` first, as in A1.
+Run identities 2 and 3 in CloudShell as `rifas-admin` (or as root). Run
+identity 1 in CloudShell as root (an admin should not delete itself). Set
+`ACCOUNT_ID` first, as in A1.
 
 Delete a user's access keys and MFA devices before the user:
 
@@ -532,28 +721,29 @@ del_mfa() {
     aws iam delete-virtual-mfa-device --serial-number "$m"
   done
 }
-P="arn:aws:iam::${ACCOUNT_ID}:policy"
+: "${ACCOUNT_ID:?}"   # stops here if ACCOUNT_ID is unset
+POL="arn:aws:iam::${ACCOUNT_ID}:policy"
 ```
 
 Identity 3 (deploy):
 
 ```bash
-aws iam detach-role-policy --role-name rifas-deploy-role --policy-arn "$P/rifas-deploy-s3"
+aws iam detach-role-policy --role-name rifas-deploy-role --policy-arn "$POL/rifas-deploy-s3"
 aws iam delete-role --role-name rifas-deploy-role
-aws iam delete-policy --policy-arn "$P/rifas-deploy-s3"
+aws iam delete-policy --policy-arn "$POL/rifas-deploy-s3"
 del_keys rifas-deploy; del_mfa rifas-deploy
-aws iam detach-user-policy --user-name rifas-deploy --policy-arn "$P/rifas-deploy-assume"
+aws iam detach-user-policy --user-name rifas-deploy --policy-arn "$POL/rifas-deploy-assume"
 aws iam delete-user --user-name rifas-deploy
-aws iam delete-policy --policy-arn "$P/rifas-deploy-assume"
+aws iam delete-policy --policy-arn "$POL/rifas-deploy-assume"
 ```
 
 Identity 2 (read-only):
 
 ```bash
 del_keys rifas-readonly
-aws iam detach-user-policy --user-name rifas-readonly --policy-arn "$P/rifas-readonly-s3"
+aws iam detach-user-policy --user-name rifas-readonly --policy-arn "$POL/rifas-readonly-s3"
 aws iam delete-user --user-name rifas-readonly
-aws iam delete-policy --policy-arn "$P/rifas-readonly-s3"
+aws iam delete-policy --policy-arn "$POL/rifas-readonly-s3"
 ```
 
 Identity 1 (admin, as root):
@@ -562,9 +752,9 @@ Identity 1 (admin, as root):
 aws iam delete-login-profile --user-name rifas-admin
 del_keys rifas-admin; del_mfa rifas-admin
 aws iam detach-user-policy --user-name rifas-admin --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
-aws iam detach-user-policy --user-name rifas-admin --policy-arn "$P/rifas-admin-require-mfa"
+aws iam detach-user-policy --user-name rifas-admin --policy-arn "$POL/rifas-admin-require-mfa"
 aws iam delete-user --user-name rifas-admin
-aws iam delete-policy --policy-arn "$P/rifas-admin-require-mfa"
+aws iam delete-policy --policy-arn "$POL/rifas-admin-require-mfa"
 ```
 
 If a policy was edited after creation, `delete-policy` fails until the
@@ -572,10 +762,12 @@ non-default versions are deleted (`aws iam list-policy-versions`, then
 `aws iam delete-policy-version` for each non-default one).
 
 Laptop: remove the `rifas-*` sections from `~/.aws/config` and
-`~/.aws/credentials` by hand, then `rm -rf ~/.aws/cli/cache ~/.aws/login/cache`.
-Remove the authenticator entries for the deleted MFA devices.
+`~/.aws/credentials` by hand, delete `~/.aws-agents`, then
+`rm -rf ~/.aws/cli/cache ~/.aws/login/cache`. Remove the authenticator entries
+for the deleted MFA devices.
 
-Partial rollback (a check failed and the policy needs a fix): fix the JSON in a
-PR first, then `aws iam create-policy-version --policy-arn ... --policy-document file://... --set-as-default`
-from a rendered copy, and re-run A6 (comparing against the new version id, not
-`v1`) and the affected V checks.
+Partial rollback (a check failed and a policy needs a fix): fix the JSON in a
+PR first, render it as in A1, then in CloudShell as `rifas-admin` run
+`aws iam create-policy-version --policy-arn ... --policy-document file://... --set-as-default`,
+and re-run A6 (comparing against the new version id, not `v1`) and the
+affected V checks.
